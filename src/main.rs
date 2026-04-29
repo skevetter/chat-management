@@ -127,6 +127,14 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         offset: i64,
     },
+    Search {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+    },
     Serve {
         #[arg(long, default_value = "stdio")]
         transport: String,
@@ -416,6 +424,41 @@ fn main() {
                 let start = offset + 1;
                 let end = offset + result.mentions.len() as i64;
                 println!("\nShowing {start}-{end} of {} mention(s)", result.total);
+            }
+        }
+        Commands::Search {
+            query,
+            channel,
+            limit,
+        } => {
+            let channel_id = channel.map(|ch| {
+                db.get_channel(&ch, namespace)
+                    .unwrap_or_else(|e| {
+                        output_error(&format!("Failed to resolve channel: {e}"), json);
+                        std::process::exit(1);
+                    })
+                    .unwrap_or_else(|| {
+                        output_error(&format!("Channel not found: {ch}"), json);
+                        std::process::exit(1);
+                    })
+                    .id
+            });
+            let result = db
+                .search_messages(&query, channel_id, namespace, limit)
+                .unwrap_or_else(|e| {
+                    output_error(&format!("Failed to search messages: {e}"), json);
+                    std::process::exit(1);
+                });
+            if json {
+                println!("{}", serde_json::to_string(&result).unwrap());
+            } else if result.results.is_empty() {
+                println!("No messages found.");
+            } else {
+                for item in &result.results {
+                    println!("{item}");
+                    println!();
+                }
+                println!("{} result(s)", result.total);
             }
         }
         Commands::Serve {

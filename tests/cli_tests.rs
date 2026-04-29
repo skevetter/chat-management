@@ -989,3 +989,178 @@ fn test_channel_list_table_shows_message_count() {
         .stdout(predicate::str::contains("MSGS"))
         .stdout(predicate::str::contains("1"));
 }
+
+// === Search (FTS5) ===
+
+#[test]
+fn test_search_basic_keyword() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "search-ch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "search-ch",
+            "--sender",
+            "alice",
+            "--content",
+            "the deploy failed on staging",
+        ])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "search-ch",
+            "--sender",
+            "bob",
+            "--content",
+            "all tests passing now",
+        ])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["search", "--query", "deploy"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deploy failed on staging"))
+        .stdout(predicate::str::contains("alice"));
+}
+
+#[test]
+fn test_search_channel_filter() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "ch-a"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "ch-b"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "ch-a",
+            "--sender",
+            "alice",
+            "--content",
+            "hello world from channel a",
+        ])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "ch-b",
+            "--sender",
+            "bob",
+            "--content",
+            "hello world from channel b",
+        ])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["search", "--query", "hello", "--channel", "ch-a"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("channel a"))
+        .stdout(predicate::str::contains("channel b").not());
+}
+
+#[test]
+fn test_search_limit() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "limit-ch"])
+        .assert()
+        .success();
+    for i in 0..5 {
+        cmd(&tmp)
+            .args([
+                "post",
+                "limit-ch",
+                "--sender",
+                "user",
+                "--content",
+                &format!("searchable message number {i}"),
+            ])
+            .assert()
+            .success();
+    }
+
+    let output = cmd_json(&tmp)
+        .args(["search", "--query", "searchable", "--limit", "2"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["results"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn test_search_no_results() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "empty-ch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "empty-ch",
+            "--sender",
+            "user",
+            "--content",
+            "nothing relevant here",
+        ])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["search", "--query", "nonexistentterm"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No messages found."));
+}
+
+#[test]
+fn test_search_json_output() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "json-ch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "json-ch",
+            "--sender",
+            "tester",
+            "--content",
+            "unique findable content here",
+        ])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args(["search", "--query", "findable"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["total"], 1);
+    let results = parsed["results"].as_array().unwrap();
+    assert_eq!(results[0]["channel"], "json-ch");
+    assert_eq!(results[0]["sender"], "tester");
+    assert!(results[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("findable"));
+    assert!(results[0]["timestamp"].as_str().is_some());
+    assert!(results[0]["id"].as_str().is_some());
+}

@@ -9,6 +9,7 @@ static MENTION_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@([a-zA-Z0-9_
 
 use crate::models::{
     Channel, ChannelListResult, Mention, MentionListResult, Message, MessageListResult,
+    SearchResult, SearchResultItem,
 };
 
 pub struct Database {
@@ -63,16 +64,24 @@ impl Database {
                  applied_at TEXT    NOT NULL
              );
 
+             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                 content,
+                 content='messages',
+                 content_rowid='rowid'
+             );
+
              CREATE TRIGGER IF NOT EXISTS trg_inc_message_count
              AFTER INSERT ON messages
              BEGIN
                  UPDATE channels SET message_count = message_count + 1 WHERE id = NEW.channel_id;
+                 INSERT INTO messages_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
              END;
 
              CREATE TRIGGER IF NOT EXISTS trg_dec_message_count
              AFTER DELETE ON messages
              BEGIN
                  UPDATE channels SET message_count = message_count - 1 WHERE id = OLD.channel_id;
+                 INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', OLD.rowid, OLD.content);
              END;",
         )?;
 
@@ -81,6 +90,22 @@ impl Database {
             "INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (1, ?1)",
             params![now],
         )?;
+
+        // Rebuild FTS index if it's empty but messages exist
+        let msg_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+        if msg_count > 0 {
+            let fts_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM messages_fts",
+                [],
+                |row| row.get(0),
+            )?;
+            if fts_count == 0 {
+                conn.execute_batch(
+                    "INSERT INTO messages_fts(messages_fts) VALUES('rebuild');",
+                )?;
+            }
+        }
 
         Ok(Self { conn })
     }
@@ -411,6 +436,60 @@ impl Database {
             limit,
             offset,
         })
+    }
+
+    pub fn search_messages(
+        &self,
+        query: &str,
+        channel_id: Option<i64>,
+        namespace: Option<&str>,
+        limit: i64,
+    ) -> Result<SearchResult> {
+        let mut conditions = vec!["messages_fts MATCH ?".to_string()];
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(query.to_string())];
+
+        if let Some(cid) = channel_id {
+            conditions.push("m.channel_id = ?".to_string());
+            param_values.push(Box::new(cid));
+        }
+        if let Some(ns) = namespace {
+            conditions.push("c.namespace = ?".to_string());
+            param_values.push(Box::new(ns.to_string()));
+        }
+
+        let where_clause = conditions.join(" AND ");
+
+        let sql = format!(
+            "SELECT m.id, c.name, m.sender, m.timestamp, m.content \
+             FROM messages m \
+             JOIN messages_fts ON messages_fts.rowid = m.rowid \
+             JOIN channels c ON c.id = m.channel_id \
+             WHERE {where_clause} \
+             ORDER BY m.timestamp DESC \
+             LIMIT ?"
+        );
+        param_values.push(Box::new(limit));
+
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok(SearchResultItem {
+                id: row.get(0)?,
+                channel: row.get(1)?,
+                sender: row.get(2)?,
+                timestamp: row.get(3)?,
+                content: row.get(4)?,
+            })
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        let total = results.len() as i64;
+        Ok(SearchResult { results, total })
     }
 
     pub fn extract_and_store_mentions(

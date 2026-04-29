@@ -271,4 +271,35 @@ impl ChatMcpServer {
             serde_json::to_string(&result).unwrap(),
         )]))
     }
+
+    #[tool(description = "Search messages using full-text search across all channels or filtered by channel")]
+    fn search_messages(
+        &self,
+        Parameters(params): Parameters<SearchMessagesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = params.limit.unwrap_or(20);
+        let ns = Some(params.namespace.as_str());
+
+        let db = self.db.lock().unwrap();
+        let channel_id = match &params.channel {
+            Some(ch) => {
+                let channel = db
+                    .get_channel(ch, ns)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                    .ok_or_else(|| {
+                        ErrorData::invalid_params(format!("Channel not found: {ch}"), None)
+                    })?;
+                Some(channel.id)
+            }
+            None => None,
+        };
+
+        let result = db
+            .search_messages(&params.query, channel_id, ns, limit)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&result).unwrap(),
+        )]))
+    }
 }

@@ -56,6 +56,32 @@ pub struct MentionListResult {
     pub offset: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResultItem {
+    pub id: String,
+    pub channel: String,
+    pub sender: String,
+    pub timestamp: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub results: Vec<SearchResultItem>,
+    pub total: i64,
+}
+
+impl fmt::Display for SearchResultItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "[{}] #{} @{}: {}",
+            self.timestamp, self.channel, self.sender, self.content
+        )?;
+        write!(f, "  id: {}", self.id)
+    }
+}
+
 impl fmt::Display for Channel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "ID:            {}", self.id)?;
