@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS mentions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_mentions_agent_channel ON mentions (mentioned_agent, channel_id);
+CREATE INDEX IF NOT EXISTS idx_mentions_message ON mentions (message_id);
 ```
 
 ### schema_versions
