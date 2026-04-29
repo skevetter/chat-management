@@ -5,8 +5,7 @@ use regex::Regex;
 use rusqlite::{Connection, Result, params};
 use uuid::Uuid;
 
-static MENTION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"@([a-zA-Z0-9_\-]+)").unwrap());
+static MENTION_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"@([a-zA-Z0-9_\-]+)").unwrap());
 
 use crate::models::{
     Channel, ChannelListResult, Mention, MentionListResult, Message, MessageListResult,

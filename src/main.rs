@@ -1,4 +1,5 @@
 mod db;
+mod mcp;
 mod models;
 
 use std::path::PathBuf;
@@ -216,7 +217,10 @@ fn main() {
                     if json {
                         println!(
                             "{}",
-                            serde_json::to_string(&serde_json::json!({"deleted": true, "channel_id": id})).unwrap()
+                            serde_json::to_string(
+                                &serde_json::json!({"deleted": true, "channel_id": id})
+                            )
+                            .unwrap()
                         );
                     } else {
                         println!("Channel deleted: {name_or_id}");
@@ -347,10 +351,7 @@ fn main() {
             } else if result.mentions.is_empty() {
                 println!("No mentions found.");
             } else {
-                println!(
-                    "{:<6} {:<38} {:<6} AGENT",
-                    "ID", "MESSAGE_ID", "CH_ID"
-                );
+                println!("{:<6} {:<38} {:<6} AGENT", "ID", "MESSAGE_ID", "CH_ID");
                 println!("{}", "-".repeat(70));
                 for m in &result.mentions {
                     println!(
@@ -363,12 +364,25 @@ fn main() {
                 println!("\nShowing {start}-{end} of {} mention(s)", result.total);
             }
         }
-        Commands::Serve { transport, .. } => {
+        Commands::Serve {
+            transport,
+            namespace,
+        } => {
             if transport != "stdio" {
                 eprintln!("Only stdio transport is supported");
                 std::process::exit(1);
             }
-            println!("MCP server not yet implemented");
+            let server = mcp::server::ChatMcpServer::new(db, namespace);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                use rmcp::ServiceExt;
+                let transport = rmcp::transport::io::stdio();
+                let service = server.serve(transport).await.unwrap();
+                service.waiting().await.unwrap();
+            });
         }
     }
 }
