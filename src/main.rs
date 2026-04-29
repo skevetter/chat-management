@@ -3,6 +3,7 @@ mod mcp;
 mod models;
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -127,6 +128,19 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         offset: i64,
     },
+    Search {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+    },
+    Wait {
+        channel: String,
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
+    },
     Serve {
         #[arg(long, default_value = "stdio")]
         transport: String,
@@ -148,11 +162,19 @@ enum ChannelCommands {
         limit: i64,
         #[arg(long, default_value_t = 0)]
         offset: i64,
+        #[arg(long)]
+        include_archived: bool,
     },
     Show {
         name_or_id: String,
     },
     Delete {
+        name_or_id: String,
+    },
+    Archive {
+        name_or_id: String,
+    },
+    Unarchive {
         name_or_id: String,
     },
 }
@@ -196,9 +218,13 @@ fn main() {
                     println!("{channel}");
                 }
             }
-            ChannelCommands::List { limit, offset } => {
+            ChannelCommands::List {
+                limit,
+                offset,
+                include_archived,
+            } => {
                 let result = db
-                    .list_channels(namespace, limit, offset)
+                    .list_channels(namespace, limit, offset, include_archived)
                     .unwrap_or_else(|e| {
                         output_error(&format!("Failed to list channels: {e}"), json);
                         std::process::exit(1);
@@ -268,6 +294,48 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+            ChannelCommands::Archive { name_or_id } => {
+                let channel = db
+                    .archive_channel(&name_or_id, namespace)
+                    .unwrap_or_else(|e| {
+                        output_error(&format!("Failed to archive channel: {e}"), json);
+                        std::process::exit(1);
+                    });
+                match channel {
+                    Some(ch) => {
+                        if json {
+                            println!("{}", serde_json::to_string(&ch).unwrap());
+                        } else {
+                            println!("Channel archived: {}", ch.name);
+                        }
+                    }
+                    None => {
+                        output_error(&format!("Channel not found: {name_or_id}"), json);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            ChannelCommands::Unarchive { name_or_id } => {
+                let channel = db
+                    .unarchive_channel(&name_or_id, namespace)
+                    .unwrap_or_else(|e| {
+                        output_error(&format!("Failed to unarchive channel: {e}"), json);
+                        std::process::exit(1);
+                    });
+                match channel {
+                    Some(ch) => {
+                        if json {
+                            println!("{}", serde_json::to_string(&ch).unwrap());
+                        } else {
+                            println!("Channel unarchived: {}", ch.name);
+                        }
+                    }
+                    None => {
+                        output_error(&format!("Channel not found: {name_or_id}"), json);
+                        std::process::exit(1);
+                    }
+                }
+            }
         },
         Commands::Post {
             channel,
@@ -290,6 +358,13 @@ fn main() {
                     output_error(&format!("Channel not found: {channel}"), json);
                     std::process::exit(1);
                 });
+            if ch.archived {
+                output_error(
+                    &format!("Cannot post to archived channel '{}'", ch.name),
+                    json,
+                );
+                std::process::exit(1);
+            }
             let message = db
                 .post_message(
                     ch.id,
@@ -416,6 +491,88 @@ fn main() {
                 let start = offset + 1;
                 let end = offset + result.mentions.len() as i64;
                 println!("\nShowing {start}-{end} of {} mention(s)", result.total);
+            }
+        }
+        Commands::Search {
+            query,
+            channel,
+            limit,
+        } => {
+            let channel_id = channel.map(|ch| {
+                db.get_channel(&ch, namespace)
+                    .unwrap_or_else(|e| {
+                        output_error(&format!("Failed to resolve channel: {e}"), json);
+                        std::process::exit(1);
+                    })
+                    .unwrap_or_else(|| {
+                        output_error(&format!("Channel not found: {ch}"), json);
+                        std::process::exit(1);
+                    })
+                    .id
+            });
+            let result = db
+                .search_messages(&query, channel_id, namespace, limit)
+                .unwrap_or_else(|e| {
+                    output_error(&format!("Failed to search messages: {e}"), json);
+                    std::process::exit(1);
+                });
+            if json {
+                println!("{}", serde_json::to_string(&result).unwrap());
+            } else if result.results.is_empty() {
+                println!("No messages found.");
+            } else {
+                for item in &result.results {
+                    println!("{item}");
+                    println!();
+                }
+                println!("{} result(s)", result.total);
+            }
+        }
+        Commands::Wait { channel, timeout } => {
+            let ch = db
+                .get_channel(&channel, namespace)
+                .unwrap_or_else(|e| {
+                    output_error(&format!("Failed to resolve channel: {e}"), json);
+                    std::process::exit(1);
+                })
+                .unwrap_or_else(|| {
+                    output_error(&format!("Channel not found: {channel}"), json);
+                    std::process::exit(1);
+                });
+            if ch.archived {
+                output_error(
+                    &format!("Cannot wait on archived channel '{}'", ch.name),
+                    json,
+                );
+                std::process::exit(1);
+            }
+            let baseline = db.get_max_message_rowid(ch.id).unwrap_or_else(|e| {
+                output_error(&format!("Failed to get baseline: {e}"), json);
+                std::process::exit(1);
+            });
+            let deadline = Duration::from_secs(timeout);
+            let start = Instant::now();
+            loop {
+                let messages = db.get_messages_after_rowid(ch.id, baseline).unwrap_or_else(|e| {
+                    output_error(&format!("Failed to poll messages: {e}"), json);
+                    std::process::exit(1);
+                });
+                if let Some(msg) = messages.first() {
+                    if json {
+                        println!("{}", serde_json::to_string(msg).unwrap());
+                    } else {
+                        println!("{msg}");
+                    }
+                    std::process::exit(0);
+                }
+                if start.elapsed() >= deadline {
+                    output_error(
+                        &format!("Timeout: no new messages in {channel} after {timeout} seconds"),
+                        json,
+                    );
+                    std::process::exit(1);
+                }
+                std::thread::sleep(Duration::from_millis(500));
             }
         }
         Commands::Serve {

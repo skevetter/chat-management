@@ -12,6 +12,7 @@ pub struct ChannelListParams {
     pub namespace: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub include_archived: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -59,4 +60,31 @@ pub struct ListMentionsParams {
     pub namespace: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct SearchMessagesParams {
+    pub query: String,
+    pub channel: Option<String>,
+    pub namespace: String,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ArchiveChannelParams {
+    pub channel: String,
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct UnarchiveChannelParams {
+    pub channel: String,
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct WaitForMessageParams {
+    pub channel: String,
+    pub namespace: String,
+    pub timeout: Option<u64>,
 }

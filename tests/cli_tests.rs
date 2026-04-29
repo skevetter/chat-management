@@ -188,7 +188,7 @@ fn test_post_message_json() {
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(parsed["sender"], "bot");
     assert_eq!(parsed["content"], "Test msg");
-    assert!(parsed["id"].as_str().unwrap().len() > 0);
+    assert!(!parsed["id"].as_str().unwrap().is_empty());
 }
 
 #[test]
@@ -988,4 +988,547 @@ fn test_channel_list_table_shows_message_count() {
         .success()
         .stdout(predicate::str::contains("MSGS"))
         .stdout(predicate::str::contains("1"));
+}
+
+// === Search (FTS5) ===
+
+#[test]
+fn test_search_basic_keyword() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "search-ch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "search-ch",
+            "--sender",
+            "alice",
+            "--content",
+            "the deploy failed on staging",
+        ])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "search-ch",
+            "--sender",
+            "bob",
+            "--content",
+            "all tests passing now",
+        ])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["search", "--query", "deploy"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deploy failed on staging"))
+        .stdout(predicate::str::contains("alice"));
+}
+
+#[test]
+fn test_search_channel_filter() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "ch-a"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "ch-b"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "ch-a",
+            "--sender",
+            "alice",
+            "--content",
+            "hello world from channel a",
+        ])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "ch-b",
+            "--sender",
+            "bob",
+            "--content",
+            "hello world from channel b",
+        ])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["search", "--query", "hello", "--channel", "ch-a"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("channel a"))
+        .stdout(predicate::str::contains("channel b").not());
+}
+
+#[test]
+fn test_search_limit() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "limit-ch"])
+        .assert()
+        .success();
+    for i in 0..5 {
+        cmd(&tmp)
+            .args([
+                "post",
+                "limit-ch",
+                "--sender",
+                "user",
+                "--content",
+                &format!("searchable message number {i}"),
+            ])
+            .assert()
+            .success();
+    }
+
+    let output = cmd_json(&tmp)
+        .args(["search", "--query", "searchable", "--limit", "2"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["results"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn test_search_no_results() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "empty-ch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "empty-ch",
+            "--sender",
+            "user",
+            "--content",
+            "nothing relevant here",
+        ])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["search", "--query", "nonexistentterm"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No messages found."));
+}
+
+#[test]
+fn test_search_json_output() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "json-ch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "json-ch",
+            "--sender",
+            "tester",
+            "--content",
+            "unique findable content here",
+        ])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args(["search", "--query", "findable"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["total"], 1);
+    let results = parsed["results"].as_array().unwrap();
+    assert_eq!(results[0]["channel"], "json-ch");
+    assert_eq!(results[0]["sender"], "tester");
+    assert!(results[0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("findable"));
+    assert!(results[0]["timestamp"].as_str().is_some());
+    assert!(results[0]["id"].as_str().is_some());
+}
+
+// === Channel Archiving ===
+
+#[test]
+fn test_archive_channel_excludes_from_list() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "active-ch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "to-archive"])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["channel", "archive", "to-archive"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("archived"));
+
+    let output = cmd_json(&tmp).args(["channel", "list"]).output().unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["total"], 1);
+    assert_eq!(parsed["channels"][0]["name"], "active-ch");
+}
+
+#[test]
+fn test_unarchive_channel_reappears_in_list() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "revive-ch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "archive", "revive-ch"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp).args(["channel", "list"]).output().unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["total"], 0);
+
+    cmd(&tmp)
+        .args(["channel", "unarchive", "revive-ch"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unarchived"));
+
+    let output = cmd_json(&tmp).args(["channel", "list"]).output().unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["total"], 1);
+    assert_eq!(parsed["channels"][0]["name"], "revive-ch");
+}
+
+#[test]
+fn test_include_archived_shows_all() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "visible"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "hidden"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "archive", "hidden"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args(["channel", "list", "--include-archived"])
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["total"], 2);
+}
+
+#[test]
+fn test_post_to_archived_channel_fails() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "frozen"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "archive", "frozen"])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args([
+            "post",
+            "frozen",
+            "--sender",
+            "agent",
+            "--content",
+            "should fail",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Cannot post to archived channel 'frozen'",
+        ));
+}
+
+#[test]
+fn test_post_to_archived_channel_json_error() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "frozen-json"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "archive", "frozen-json"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args([
+            "post",
+            "frozen-json",
+            "--sender",
+            "agent",
+            "--content",
+            "nope",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    assert!(parsed["error"]
+        .as_str()
+        .unwrap()
+        .contains("Cannot post to archived channel"));
+}
+
+#[test]
+fn test_read_from_archived_channel_works() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "readable"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "readable",
+            "--sender",
+            "agent",
+            "--content",
+            "still here",
+        ])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "archive", "readable"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args(["read", "readable"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["total"], 1);
+    assert_eq!(parsed["messages"][0]["content"], "still here");
+}
+
+#[test]
+fn test_archive_unarchive_by_name() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "named-ch"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args(["channel", "archive", "named-ch"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["name"], "named-ch");
+    assert_eq!(parsed["archived"], true);
+
+    let output = cmd_json(&tmp)
+        .args(["channel", "unarchive", "named-ch"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["name"], "named-ch");
+    assert_eq!(parsed["archived"], false);
+}
+
+#[test]
+fn test_archive_nonexistent_channel_fails() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "archive", "ghost"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+}
+
+// === Wait Command ===
+
+#[test]
+fn test_wait_detects_message_with_thread() {
+    use std::thread;
+    use std::time::Duration;
+
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("test.db").to_str().unwrap().to_string();
+
+    // Create channel
+    Command::cargo_bin("chat-management")
+        .unwrap()
+        .args(["--db", &db_path, "channel", "create", "--name", "wait-th"])
+        .assert()
+        .success();
+
+    // Spawn a thread that will post a message after a short delay
+    let db_path_clone = db_path.clone();
+    let poster = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(800));
+        Command::cargo_bin("chat-management")
+            .unwrap()
+            .args([
+                "--db",
+                &db_path_clone,
+                "post",
+                "wait-th",
+                "--sender",
+                "poster",
+                "--content",
+                "hello from thread",
+            ])
+            .assert()
+            .success();
+    });
+
+    // Run wait — should block until the poster thread posts
+    Command::cargo_bin("chat-management")
+        .unwrap()
+        .args(["--db", &db_path, "wait", "wait-th", "--timeout", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello from thread"))
+        .stdout(predicate::str::contains("poster"));
+
+    poster.join().unwrap();
+}
+
+#[test]
+fn test_wait_timeout() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "wait-to"])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["wait", "wait-to", "--timeout", "1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Timeout: no new messages in wait-to after 1 seconds",
+        ));
+}
+
+#[test]
+fn test_wait_nonexistent_channel() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["wait", "ghost-channel", "--timeout", "1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+}
+
+#[test]
+fn test_wait_archived_channel() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "wait-arch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "archive", "wait-arch"])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["wait", "wait-arch", "--timeout", "1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Cannot wait on archived channel",
+        ));
+}
+
+#[test]
+fn test_wait_json_output() {
+    use std::thread;
+    use std::time::Duration;
+
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("test.db").to_str().unwrap().to_string();
+
+    Command::cargo_bin("chat-management")
+        .unwrap()
+        .args([
+            "--db",
+            &db_path,
+            "channel",
+            "create",
+            "--name",
+            "wait-json",
+        ])
+        .assert()
+        .success();
+
+    let db_path_clone = db_path.clone();
+    let poster = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(800));
+        Command::cargo_bin("chat-management")
+            .unwrap()
+            .args([
+                "--db",
+                &db_path_clone,
+                "post",
+                "wait-json",
+                "--sender",
+                "json-poster",
+                "--content",
+                "json wait test",
+            ])
+            .assert()
+            .success();
+    });
+
+    let output = Command::cargo_bin("chat-management")
+        .unwrap()
+        .args([
+            "--db",
+            &db_path,
+            "--json",
+            "wait",
+            "wait-json",
+            "--timeout",
+            "5",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["sender"], "json-poster");
+    assert_eq!(parsed["content"], "json wait test");
+    assert!(parsed["id"].as_str().is_some());
+    assert!(parsed["timestamp"].as_str().is_some());
+
+    poster.join().unwrap();
 }

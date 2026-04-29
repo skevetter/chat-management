@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use regex::Regex;
@@ -93,10 +94,11 @@ impl ChatMcpServer {
         let ns = self.resolve_namespace(&params.namespace);
         let limit = params.limit.unwrap_or(50);
         let offset = params.offset.unwrap_or(0);
+        let include_archived = params.include_archived.unwrap_or(false);
 
         let db = self.db.lock().unwrap();
         let result = db
-            .list_channels(ns, limit, offset)
+            .list_channels(ns, limit, offset, include_archived)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -145,6 +147,46 @@ impl ChatMcpServer {
         )]))
     }
 
+    #[tool(description = "Archive a channel (prevents new posts)")]
+    fn archive_channel(
+        &self,
+        Parameters(params): Parameters<ArchiveChannelParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ns = self.resolve_namespace(&params.namespace);
+
+        let db = self.db.lock().unwrap();
+        let channel = db
+            .archive_channel(&params.channel, ns)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            .ok_or_else(|| {
+                ErrorData::invalid_params(format!("Channel not found: {}", params.channel), None)
+            })?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&channel).unwrap(),
+        )]))
+    }
+
+    #[tool(description = "Unarchive a channel (allows new posts again)")]
+    fn unarchive_channel(
+        &self,
+        Parameters(params): Parameters<UnarchiveChannelParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ns = self.resolve_namespace(&params.namespace);
+
+        let db = self.db.lock().unwrap();
+        let channel = db
+            .unarchive_channel(&params.channel, ns)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            .ok_or_else(|| {
+                ErrorData::invalid_params(format!("Channel not found: {}", params.channel), None)
+            })?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&channel).unwrap(),
+        )]))
+    }
+
     #[tool(description = "Post a message to a channel")]
     fn post_message(
         &self,
@@ -166,6 +208,13 @@ impl ChatMcpServer {
             .ok_or_else(|| {
                 ErrorData::invalid_params(format!("Channel not found: {}", params.channel), None)
             })?;
+
+        if channel.archived {
+            return Err(ErrorData::invalid_params(
+                format!("Cannot post to archived channel '{}'", channel.name),
+                None,
+            ));
+        }
 
         let message = db
             .post_message(
@@ -270,5 +319,96 @@ impl ChatMcpServer {
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string(&result).unwrap(),
         )]))
+    }
+
+    #[tool(description = "Search messages using full-text search across all channels or filtered by channel")]
+    fn search_messages(
+        &self,
+        Parameters(params): Parameters<SearchMessagesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = params.limit.unwrap_or(20);
+        let ns = Some(params.namespace.as_str());
+
+        let db = self.db.lock().unwrap();
+        let channel_id = match &params.channel {
+            Some(ch) => {
+                let channel = db
+                    .get_channel(ch, ns)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                    .ok_or_else(|| {
+                        ErrorData::invalid_params(format!("Channel not found: {ch}"), None)
+                    })?;
+                Some(channel.id)
+            }
+            None => None,
+        };
+
+        let result = db
+            .search_messages(&params.query, channel_id, ns, limit)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&result).unwrap(),
+        )]))
+    }
+
+    #[tool(description = "Wait for a new message in a channel (blocks until message arrives or timeout)")]
+    fn wait_for_message(
+        &self,
+        Parameters(params): Parameters<WaitForMessageParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ns = Some(params.namespace.as_str());
+        let timeout = params.timeout.unwrap_or(300);
+
+        let (channel_id, baseline) = {
+            let db = self.db.lock().unwrap();
+            let channel = db
+                .get_channel(&params.channel, ns)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                .ok_or_else(|| {
+                    ErrorData::invalid_params(
+                        format!("Channel not found: {}", params.channel),
+                        None,
+                    )
+                })?;
+
+            if channel.archived {
+                return Err(ErrorData::invalid_params(
+                    format!("Cannot wait on archived channel '{}'", channel.name),
+                    None,
+                ));
+            }
+
+            let baseline = db
+                .get_max_message_rowid(channel.id)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            (channel.id, baseline)
+        };
+
+        let deadline = Duration::from_secs(timeout);
+        let start = Instant::now();
+        loop {
+            {
+                let db = self.db.lock().unwrap();
+                let messages = db
+                    .get_messages_after_rowid(channel_id, baseline)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                if let Some(msg) = messages.first() {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        serde_json::to_string(msg).unwrap(),
+                    )]));
+                }
+            }
+            if start.elapsed() >= deadline {
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "Timeout: no new messages in {} after {} seconds",
+                        params.channel, timeout
+                    ),
+                    None,
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 }

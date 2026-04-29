@@ -10,6 +10,7 @@ pub struct Channel {
     pub purpose: Option<String>,
     pub created_at: String,
     pub message_count: i64,
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +57,32 @@ pub struct MentionListResult {
     pub offset: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResultItem {
+    pub id: String,
+    pub channel: String,
+    pub sender: String,
+    pub timestamp: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub results: Vec<SearchResultItem>,
+    pub total: i64,
+}
+
+impl fmt::Display for SearchResultItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "[{}] #{} @{}: {}",
+            self.timestamp, self.channel, self.sender, self.content
+        )?;
+        write!(f, "  id: {}", self.id)
+    }
+}
+
 impl fmt::Display for Channel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "ID:            {}", self.id)?;
@@ -65,6 +92,9 @@ impl fmt::Display for Channel {
             writeln!(f, "Purpose:       {purpose}")?;
         }
         writeln!(f, "Messages:      {}", self.message_count)?;
+        if self.archived {
+            writeln!(f, "Archived:      true")?;
+        }
         write!(f, "Created:       {}", self.created_at)
     }
 }
