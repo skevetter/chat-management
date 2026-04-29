@@ -81,3 +81,10 @@ pub struct UnarchiveChannelParams {
     pub channel: String,
     pub namespace: Option<String>,
 }
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct WaitForMessageParams {
+    pub channel: String,
+    pub namespace: String,
+    pub timeout: Option<u64>,
+}

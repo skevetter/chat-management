@@ -552,6 +552,36 @@ impl Database {
         Ok(SearchResult { results, total })
     }
 
+    pub fn get_max_message_rowid(&self, channel_id: i64) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM messages WHERE channel_id = ?1",
+            params![channel_id],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn get_messages_after_rowid(&self, channel_id: i64, after_rowid: i64) -> Result<Vec<Message>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, channel_id, sender, content, timestamp, reply_to, idempotency_key FROM messages WHERE channel_id = ?1 AND rowid > ?2 ORDER BY rowid ASC"
+        )?;
+        let rows = stmt.query_map(params![channel_id, after_rowid], |row| {
+            Ok(Message {
+                id: row.get(0)?,
+                channel_id: row.get(1)?,
+                sender: row.get(2)?,
+                content: row.get(3)?,
+                timestamp: row.get(4)?,
+                reply_to: row.get(5)?,
+                idempotency_key: row.get(6)?,
+            })
+        })?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        Ok(messages)
+    }
+
     pub fn extract_and_store_mentions(
         &self,
         message_id: &str,

@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use regex::Regex;
@@ -349,5 +350,65 @@ impl ChatMcpServer {
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::to_string(&result).unwrap(),
         )]))
+    }
+
+    #[tool(description = "Wait for a new message in a channel (blocks until message arrives or timeout)")]
+    fn wait_for_message(
+        &self,
+        Parameters(params): Parameters<WaitForMessageParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ns = Some(params.namespace.as_str());
+        let timeout = params.timeout.unwrap_or(300);
+
+        let (channel_id, baseline) = {
+            let db = self.db.lock().unwrap();
+            let channel = db
+                .get_channel(&params.channel, ns)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+                .ok_or_else(|| {
+                    ErrorData::invalid_params(
+                        format!("Channel not found: {}", params.channel),
+                        None,
+                    )
+                })?;
+
+            if channel.archived {
+                return Err(ErrorData::invalid_params(
+                    format!("Cannot wait on archived channel '{}'", channel.name),
+                    None,
+                ));
+            }
+
+            let baseline = db
+                .get_max_message_rowid(channel.id)
+                .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            (channel.id, baseline)
+        };
+
+        let deadline = Duration::from_secs(timeout);
+        let start = Instant::now();
+        loop {
+            {
+                let db = self.db.lock().unwrap();
+                let messages = db
+                    .get_messages_after_rowid(channel_id, baseline)
+                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+                if let Some(msg) = messages.first() {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        serde_json::to_string(msg).unwrap(),
+                    )]));
+                }
+            }
+            if start.elapsed() >= deadline {
+                return Err(ErrorData::internal_error(
+                    format!(
+                        "Timeout: no new messages in {} after {} seconds",
+                        params.channel, timeout
+                    ),
+                    None,
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 }

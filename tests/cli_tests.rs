@@ -1372,3 +1372,163 @@ fn test_archive_nonexistent_channel_fails() {
         .failure()
         .stderr(predicate::str::contains("not found"));
 }
+
+// === Wait Command ===
+
+#[test]
+fn test_wait_detects_message_with_thread() {
+    use std::thread;
+    use std::time::Duration;
+
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("test.db").to_str().unwrap().to_string();
+
+    // Create channel
+    Command::cargo_bin("chat-management")
+        .unwrap()
+        .args(["--db", &db_path, "channel", "create", "--name", "wait-th"])
+        .assert()
+        .success();
+
+    // Spawn a thread that will post a message after a short delay
+    let db_path_clone = db_path.clone();
+    let poster = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(800));
+        Command::cargo_bin("chat-management")
+            .unwrap()
+            .args([
+                "--db",
+                &db_path_clone,
+                "post",
+                "wait-th",
+                "--sender",
+                "poster",
+                "--content",
+                "hello from thread",
+            ])
+            .assert()
+            .success();
+    });
+
+    // Run wait — should block until the poster thread posts
+    Command::cargo_bin("chat-management")
+        .unwrap()
+        .args(["--db", &db_path, "wait", "wait-th", "--timeout", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hello from thread"))
+        .stdout(predicate::str::contains("poster"));
+
+    poster.join().unwrap();
+}
+
+#[test]
+fn test_wait_timeout() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "wait-to"])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["wait", "wait-to", "--timeout", "1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Timeout: no new messages in wait-to after 1 seconds",
+        ));
+}
+
+#[test]
+fn test_wait_nonexistent_channel() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["wait", "ghost-channel", "--timeout", "1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+}
+
+#[test]
+fn test_wait_archived_channel() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "wait-arch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "archive", "wait-arch"])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["wait", "wait-arch", "--timeout", "1"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Cannot wait on archived channel",
+        ));
+}
+
+#[test]
+fn test_wait_json_output() {
+    use std::thread;
+    use std::time::Duration;
+
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("test.db").to_str().unwrap().to_string();
+
+    Command::cargo_bin("chat-management")
+        .unwrap()
+        .args([
+            "--db",
+            &db_path,
+            "channel",
+            "create",
+            "--name",
+            "wait-json",
+        ])
+        .assert()
+        .success();
+
+    let db_path_clone = db_path.clone();
+    let poster = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(800));
+        Command::cargo_bin("chat-management")
+            .unwrap()
+            .args([
+                "--db",
+                &db_path_clone,
+                "post",
+                "wait-json",
+                "--sender",
+                "json-poster",
+                "--content",
+                "json wait test",
+            ])
+            .assert()
+            .success();
+    });
+
+    let output = Command::cargo_bin("chat-management")
+        .unwrap()
+        .args([
+            "--db",
+            &db_path,
+            "--json",
+            "wait",
+            "wait-json",
+            "--timeout",
+            "5",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["sender"], "json-poster");
+    assert_eq!(parsed["content"], "json wait test");
+    assert!(parsed["id"].as_str().is_some());
+    assert!(parsed["timestamp"].as_str().is_some());
+
+    poster.join().unwrap();
+}

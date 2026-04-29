@@ -3,6 +3,7 @@ mod mcp;
 mod models;
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -134,6 +135,11 @@ enum Commands {
         channel: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: i64,
+    },
+    Wait {
+        channel: String,
+        #[arg(long, default_value_t = 300)]
+        timeout: u64,
     },
     Serve {
         #[arg(long, default_value = "stdio")]
@@ -520,6 +526,53 @@ fn main() {
                     println!();
                 }
                 println!("{} result(s)", result.total);
+            }
+        }
+        Commands::Wait { channel, timeout } => {
+            let ch = db
+                .get_channel(&channel, namespace)
+                .unwrap_or_else(|e| {
+                    output_error(&format!("Failed to resolve channel: {e}"), json);
+                    std::process::exit(1);
+                })
+                .unwrap_or_else(|| {
+                    output_error(&format!("Channel not found: {channel}"), json);
+                    std::process::exit(1);
+                });
+            if ch.archived {
+                output_error(
+                    &format!("Cannot wait on archived channel '{}'", ch.name),
+                    json,
+                );
+                std::process::exit(1);
+            }
+            let baseline = db.get_max_message_rowid(ch.id).unwrap_or_else(|e| {
+                output_error(&format!("Failed to get baseline: {e}"), json);
+                std::process::exit(1);
+            });
+            let deadline = Duration::from_secs(timeout);
+            let start = Instant::now();
+            loop {
+                let messages = db.get_messages_after_rowid(ch.id, baseline).unwrap_or_else(|e| {
+                    output_error(&format!("Failed to poll messages: {e}"), json);
+                    std::process::exit(1);
+                });
+                if let Some(msg) = messages.first() {
+                    if json {
+                        println!("{}", serde_json::to_string(msg).unwrap());
+                    } else {
+                        println!("{msg}");
+                    }
+                    std::process::exit(0);
+                }
+                if start.elapsed() >= deadline {
+                    output_error(
+                        &format!("Timeout: no new messages in {channel} after {timeout} seconds"),
+                        json,
+                    );
+                    std::process::exit(1);
+                }
+                std::thread::sleep(Duration::from_millis(500));
             }
         }
         Commands::Serve {
