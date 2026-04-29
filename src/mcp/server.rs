@@ -321,7 +321,9 @@ impl ChatMcpServer {
         )]))
     }
 
-    #[tool(description = "Search messages using full-text search across all channels or filtered by channel")]
+    #[tool(
+        description = "Search messages using full-text search across all channels or filtered by channel"
+    )]
     fn search_messages(
         &self,
         Parameters(params): Parameters<SearchMessagesParams>,
@@ -352,7 +354,9 @@ impl ChatMcpServer {
         )]))
     }
 
-    #[tool(description = "Wait for a new message in a channel (blocks until message arrives or timeout)")]
+    #[tool(
+        description = "Wait for a new message in a channel (blocks until message arrives or timeout)"
+    )]
     fn wait_for_message(
         &self,
         Parameters(params): Parameters<WaitForMessageParams>,
