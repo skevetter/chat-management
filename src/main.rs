@@ -4,9 +4,47 @@ mod models;
 
 use std::path::PathBuf;
 
+use chrono::Utc;
 use clap::{Parser, Subcommand};
+use regex::Regex;
 
 use db::Database;
+
+fn parse_relative_duration(s: &str) -> Option<String> {
+    let re = Regex::new(r"^(\d+)(s|m|h|d)$").unwrap();
+    let caps = re.captures(s)?;
+    let amount: i64 = caps[1].parse().ok()?;
+    let seconds = match &caps[2] {
+        "s" => amount,
+        "m" => amount * 60,
+        "h" => amount * 3600,
+        "d" => amount * 86400,
+        _ => return None,
+    };
+    let now = Utc::now();
+    let past = now - chrono::Duration::seconds(seconds);
+    Some(past.to_rfc3339())
+}
+
+fn resolve_since(since: &str) -> Result<String, String> {
+    if let Some(ts) = parse_relative_duration(since) {
+        return Ok(ts);
+    }
+    if chrono::DateTime::parse_from_rfc3339(since).is_ok() {
+        return Ok(since.to_string());
+    }
+    Err(format!(
+        "Invalid --since value: '{since}'. Use a relative duration (e.g., '5m', '1h', '30s') or an ISO 8601 timestamp."
+    ))
+}
+
+fn output_error(msg: &str, json: bool) {
+    if json {
+        eprintln!("{}", serde_json::json!({"error": msg}));
+    } else {
+        eprintln!("{msg}");
+    }
+}
 
 fn default_db_path() -> PathBuf {
     let base = match std::env::var("XDG_DATA_HOME") {
@@ -121,6 +159,7 @@ enum ChannelCommands {
 
 fn main() {
     let cli = Cli::parse();
+    let json = cli.json;
     let db_path = match cli.db {
         Some(p) => PathBuf::from(p),
         None => default_db_path(),
@@ -129,17 +168,16 @@ fn main() {
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-            eprintln!("Failed to create database directory: {e}");
+            output_error(&format!("Failed to create database directory: {e}"), json);
             std::process::exit(1);
         });
     }
     let db_str = db_path.to_string_lossy();
     let db = Database::open(&db_str).unwrap_or_else(|e| {
-        eprintln!("Failed to open database: {e}");
+        output_error(&format!("Failed to open database: {e}"), json);
         std::process::exit(1);
     });
 
-    let json = cli.json;
     let namespace = cli.namespace.as_deref();
 
     match cli.command {
@@ -149,7 +187,7 @@ fn main() {
                 let channel = db
                     .create_channel(&name, ns, purpose.as_deref())
                     .unwrap_or_else(|e| {
-                        eprintln!("Failed to create channel: {e}");
+                        output_error(&format!("Failed to create channel: {e}"), json);
                         std::process::exit(1);
                     });
                 if json {
@@ -162,7 +200,7 @@ fn main() {
                 let result = db
                     .list_channels(namespace, limit, offset)
                     .unwrap_or_else(|e| {
-                        eprintln!("Failed to list channels: {e}");
+                        output_error(&format!("Failed to list channels: {e}"), json);
                         std::process::exit(1);
                     });
                 if json {
@@ -189,7 +227,7 @@ fn main() {
             }
             ChannelCommands::Show { name_or_id } => {
                 let channel = db.get_channel(&name_or_id, namespace).unwrap_or_else(|e| {
-                    eprintln!("Failed to get channel: {e}");
+                    output_error(&format!("Failed to get channel: {e}"), json);
                     std::process::exit(1);
                 });
                 match channel {
@@ -201,7 +239,7 @@ fn main() {
                         }
                     }
                     None => {
-                        eprintln!("Channel not found: {name_or_id}");
+                        output_error(&format!("Channel not found: {name_or_id}"), json);
                         std::process::exit(1);
                     }
                 }
@@ -210,7 +248,7 @@ fn main() {
                 let deleted_id = db
                     .delete_channel(&name_or_id, namespace)
                     .unwrap_or_else(|e| {
-                        eprintln!("Failed to delete channel: {e}");
+                        output_error(&format!("Failed to delete channel: {e}"), json);
                         std::process::exit(1);
                     });
                 if let Some(id) = deleted_id {
@@ -226,7 +264,7 @@ fn main() {
                         println!("Channel deleted: {name_or_id}");
                     }
                 } else {
-                    eprintln!("Channel not found: {name_or_id}");
+                    output_error(&format!("Channel not found: {name_or_id}"), json);
                     std::process::exit(1);
                 }
             }
@@ -238,14 +276,18 @@ fn main() {
             reply_to,
             idempotency_key,
         } => {
+            if content.trim().is_empty() {
+                output_error("Message content cannot be empty", json);
+                std::process::exit(1);
+            }
             let ch = db
                 .get_channel(&channel, namespace)
                 .unwrap_or_else(|e| {
-                    eprintln!("Failed to resolve channel: {e}");
+                    output_error(&format!("Failed to resolve channel: {e}"), json);
                     std::process::exit(1);
                 })
                 .unwrap_or_else(|| {
-                    eprintln!("Channel not found: {channel}");
+                    output_error(&format!("Channel not found: {channel}"), json);
                     std::process::exit(1);
                 });
             let message = db
@@ -257,7 +299,7 @@ fn main() {
                     idempotency_key.as_deref(),
                 )
                 .unwrap_or_else(|e| {
-                    eprintln!("Failed to post message: {e}");
+                    output_error(&format!("Failed to post message: {e}"), json);
                     std::process::exit(1);
                 });
             if json {
@@ -273,20 +315,32 @@ fn main() {
             since,
             sender,
         } => {
+            let resolved_since = since.map(|s| {
+                resolve_since(&s).unwrap_or_else(|e| {
+                    output_error(&e, json);
+                    std::process::exit(1);
+                })
+            });
             let ch = db
                 .get_channel(&channel, namespace)
                 .unwrap_or_else(|e| {
-                    eprintln!("Failed to resolve channel: {e}");
+                    output_error(&format!("Failed to resolve channel: {e}"), json);
                     std::process::exit(1);
                 })
                 .unwrap_or_else(|| {
-                    eprintln!("Channel not found: {channel}");
+                    output_error(&format!("Channel not found: {channel}"), json);
                     std::process::exit(1);
                 });
             let result = db
-                .read_messages(ch.id, limit, offset, since.as_deref(), sender.as_deref())
+                .read_messages(
+                    ch.id,
+                    limit,
+                    offset,
+                    resolved_since.as_deref(),
+                    sender.as_deref(),
+                )
                 .unwrap_or_else(|e| {
-                    eprintln!("Failed to read messages: {e}");
+                    output_error(&format!("Failed to read messages: {e}"), json);
                     std::process::exit(1);
                 });
             if json {
@@ -305,7 +359,7 @@ fn main() {
         }
         Commands::Inspect { channel } => {
             let ch = db.inspect_channel(&channel, namespace).unwrap_or_else(|e| {
-                eprintln!("Failed to inspect channel: {e}");
+                output_error(&format!("Failed to inspect channel: {e}"), json);
                 std::process::exit(1);
             });
             match ch {
@@ -317,7 +371,7 @@ fn main() {
                     }
                 }
                 None => {
-                    eprintln!("Channel not found: {channel}");
+                    output_error(&format!("Channel not found: {channel}"), json);
                     std::process::exit(1);
                 }
             }
@@ -331,11 +385,11 @@ fn main() {
             let channel_id = channel.map(|ch| {
                 db.get_channel(&ch, namespace)
                     .unwrap_or_else(|e| {
-                        eprintln!("Failed to resolve channel: {e}");
+                        output_error(&format!("Failed to resolve channel: {e}"), json);
                         std::process::exit(1);
                     })
                     .unwrap_or_else(|| {
-                        eprintln!("Channel not found: {ch}");
+                        output_error(&format!("Channel not found: {ch}"), json);
                         std::process::exit(1);
                     })
                     .id
@@ -343,7 +397,7 @@ fn main() {
             let result = db
                 .list_mentions(agent.as_deref(), channel_id, limit, offset)
                 .unwrap_or_else(|e| {
-                    eprintln!("Failed to list mentions: {e}");
+                    output_error(&format!("Failed to list mentions: {e}"), json);
                     std::process::exit(1);
                 });
             if json {

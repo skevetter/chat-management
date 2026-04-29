@@ -1,5 +1,7 @@
 use std::sync::Mutex;
 
+use chrono::Utc;
+use regex::Regex;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, tool, tool_router};
@@ -7,6 +9,34 @@ use rmcp::{ErrorData, tool, tool_router};
 use crate::db::Database;
 
 use super::tools::*;
+
+fn parse_relative_duration(s: &str) -> Option<String> {
+    let re = Regex::new(r"^(\d+)(s|m|h|d)$").unwrap();
+    let caps = re.captures(s)?;
+    let amount: i64 = caps[1].parse().ok()?;
+    let seconds = match &caps[2] {
+        "s" => amount,
+        "m" => amount * 60,
+        "h" => amount * 3600,
+        "d" => amount * 86400,
+        _ => return None,
+    };
+    let now = Utc::now();
+    let past = now - chrono::Duration::seconds(seconds);
+    Some(past.to_rfc3339())
+}
+
+fn resolve_since(since: &str) -> Result<String, String> {
+    if let Some(ts) = parse_relative_duration(since) {
+        return Ok(ts);
+    }
+    if chrono::DateTime::parse_from_rfc3339(since).is_ok() {
+        return Ok(since.to_string());
+    }
+    Err(format!(
+        "Invalid since value: '{since}'. Use a relative duration (e.g., '5m', '1h', '30s') or an ISO 8601 timestamp."
+    ))
+}
 
 pub struct ChatMcpServer {
     db: Mutex<Database>,
@@ -120,6 +150,13 @@ impl ChatMcpServer {
         &self,
         Parameters(params): Parameters<PostMessageParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if params.content.trim().is_empty() {
+            return Err(ErrorData::invalid_params(
+                "Message content cannot be empty".to_string(),
+                None,
+            ));
+        }
+
         let ns = self.resolve_namespace(&params.namespace);
 
         let db = self.db.lock().unwrap();
@@ -154,6 +191,12 @@ impl ChatMcpServer {
         let limit = params.limit.unwrap_or(50);
         let offset = params.offset.unwrap_or(0);
 
+        let resolved_since = params
+            .since
+            .as_deref()
+            .map(|s| resolve_since(s).map_err(|e| ErrorData::invalid_params(e, None)))
+            .transpose()?;
+
         let db = self.db.lock().unwrap();
         let channel = db
             .get_channel(&params.channel, ns)
@@ -167,7 +210,7 @@ impl ChatMcpServer {
                 channel.id,
                 limit,
                 offset,
-                params.since.as_deref(),
+                resolved_since.as_deref(),
                 params.sender.as_deref(),
             )
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
