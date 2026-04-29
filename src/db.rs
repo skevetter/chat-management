@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::LazyLock;
 
 use chrono::Utc;
@@ -18,12 +19,64 @@ pub struct Database {
 
 impl Database {
     pub fn open(path: &str) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA foreign_keys = ON;
+        let db_path = Path::new(path);
+        let backup_path = format!("{}.bak", path);
 
-             CREATE TABLE IF NOT EXISTS channels (
+        if db_path.exists() {
+            std::fs::copy(db_path, &backup_path).map_err(|e| {
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(1),
+                    Some(format!("Failed to create backup: {e}")),
+                )
+            })?;
+        }
+
+        let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+
+        if let Err(e) = Self::run_migrations(&conn) {
+            eprintln!("Migration failed: {e}");
+            if Path::new(&backup_path).exists() {
+                drop(conn);
+                if let Err(restore_err) = std::fs::copy(&backup_path, db_path) {
+                    eprintln!("Failed to restore backup: {restore_err}");
+                }
+            }
+            return Err(e);
+        }
+
+        let msg_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+        let fts_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |row| row.get(0))?;
+
+        if msg_count != fts_count {
+            eprintln!(
+                "FTS verification failed: messages={msg_count}, fts={fts_count}. Restoring backup."
+            );
+            if Path::new(&backup_path).exists() {
+                drop(conn);
+                std::fs::copy(&backup_path, db_path).map_err(|e| {
+                    rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(1),
+                        Some(format!("Failed to restore backup: {e}")),
+                    )
+                })?;
+            }
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(1),
+                Some("FTS index count does not match messages count".to_string()),
+            ));
+        }
+
+        Ok(Self { conn })
+    }
+
+    fn run_migrations(conn: &Connection) -> Result<()> {
+        conn.execute_batch("BEGIN;")?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channels (
                  id            INTEGER PRIMARY KEY AUTOINCREMENT,
                  name          TEXT    NOT NULL,
                  namespace     TEXT    NOT NULL DEFAULT 'default',
@@ -107,23 +160,31 @@ impl Database {
             )?;
         }
 
-        // Rebuild FTS index if it's empty but messages exist
-        let msg_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
-        if msg_count > 0 {
-            let fts_count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM messages_fts",
+        // Migration v3: backfill FTS index for pre-existing messages
+        let has_v3: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_versions WHERE version = 3",
                 [],
-                |row| row.get(0),
-            )?;
-            if fts_count == 0 {
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)?;
+        if !has_v3 {
+            let msg_count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+            if msg_count > 0 {
                 conn.execute_batch(
-                    "INSERT INTO messages_fts(messages_fts) VALUES('rebuild');",
+                    "INSERT INTO messages_fts(rowid, content) SELECT rowid, content FROM messages;",
                 )?;
+                eprintln!("Backfilled {msg_count} messages into FTS index");
             }
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (3, ?1)",
+                params![now],
+            )?;
         }
 
-        Ok(Self { conn })
+        conn.execute_batch("COMMIT;")?;
+        Ok(())
     }
 
     pub fn create_channel(
@@ -560,7 +621,11 @@ impl Database {
         )
     }
 
-    pub fn get_messages_after_rowid(&self, channel_id: i64, after_rowid: i64) -> Result<Vec<Message>> {
+    pub fn get_messages_after_rowid(
+        &self,
+        channel_id: i64,
+        after_rowid: i64,
+    ) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, channel_id, sender, content, timestamp, reply_to, idempotency_key FROM messages WHERE channel_id = ?1 AND rowid > ?2 ORDER BY rowid ASC"
         )?;

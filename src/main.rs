@@ -553,10 +553,12 @@ fn main() {
             let deadline = Duration::from_secs(timeout);
             let start = Instant::now();
             loop {
-                let messages = db.get_messages_after_rowid(ch.id, baseline).unwrap_or_else(|e| {
-                    output_error(&format!("Failed to poll messages: {e}"), json);
-                    std::process::exit(1);
-                });
+                let messages = db
+                    .get_messages_after_rowid(ch.id, baseline)
+                    .unwrap_or_else(|e| {
+                        output_error(&format!("Failed to poll messages: {e}"), json);
+                        std::process::exit(1);
+                    });
                 if let Some(msg) = messages.first() {
                     if json {
                         println!("{}", serde_json::to_string(msg).unwrap());

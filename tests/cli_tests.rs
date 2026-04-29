@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use rusqlite::params;
 use tempfile::TempDir;
 
 fn cmd(tmp: &TempDir) -> Command {
@@ -1157,10 +1158,7 @@ fn test_search_json_output() {
     let results = parsed["results"].as_array().unwrap();
     assert_eq!(results[0]["channel"], "json-ch");
     assert_eq!(results[0]["sender"], "tester");
-    assert!(results[0]["content"]
-        .as_str()
-        .unwrap()
-        .contains("findable"));
+    assert!(results[0]["content"].as_str().unwrap().contains("findable"));
     assert!(results[0]["timestamp"].as_str().is_some());
     assert!(results[0]["id"].as_str().is_some());
 }
@@ -1297,10 +1295,12 @@ fn test_post_to_archived_channel_json_error() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     let parsed: serde_json::Value = serde_json::from_str(&stderr).unwrap();
-    assert!(parsed["error"]
-        .as_str()
-        .unwrap()
-        .contains("Cannot post to archived channel"));
+    assert!(
+        parsed["error"]
+            .as_str()
+            .unwrap()
+            .contains("Cannot post to archived channel")
+    );
 }
 
 #[test]
@@ -1326,10 +1326,7 @@ fn test_read_from_archived_channel_works() {
         .assert()
         .success();
 
-    let output = cmd_json(&tmp)
-        .args(["read", "readable"])
-        .output()
-        .unwrap();
+    let output = cmd_json(&tmp).args(["read", "readable"]).output().unwrap();
     assert!(output.status.success());
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(parsed["total"], 1);
@@ -1465,9 +1462,7 @@ fn test_wait_archived_channel() {
         .args(["wait", "wait-arch", "--timeout", "1"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "Cannot wait on archived channel",
-        ));
+        .stderr(predicate::str::contains("Cannot wait on archived channel"));
 }
 
 #[test]
@@ -1480,14 +1475,7 @@ fn test_wait_json_output() {
 
     Command::cargo_bin("chat-management")
         .unwrap()
-        .args([
-            "--db",
-            &db_path,
-            "channel",
-            "create",
-            "--name",
-            "wait-json",
-        ])
+        .args(["--db", &db_path, "channel", "create", "--name", "wait-json"])
         .assert()
         .success();
 
@@ -1531,4 +1519,110 @@ fn test_wait_json_output() {
     assert!(parsed["timestamp"].as_str().is_some());
 
     poster.join().unwrap();
+}
+
+// === FTS5 Backfill on Upgrade ===
+
+#[test]
+fn test_fts5_backfill_existing_messages() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("test.db");
+    let db_str = db_path.to_str().unwrap();
+
+    // Create old schema (no FTS table, no triggers) and insert messages directly
+    {
+        let conn = rusqlite::Connection::open(db_str).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE channels (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 name          TEXT    NOT NULL,
+                 namespace     TEXT    NOT NULL DEFAULT 'default',
+                 purpose       TEXT,
+                 created_at    TEXT    NOT NULL,
+                 message_count INTEGER NOT NULL DEFAULT 0,
+                 UNIQUE (name, namespace)
+             );
+
+             CREATE TABLE messages (
+                 id              TEXT PRIMARY KEY,
+                 channel_id      INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+                 sender          TEXT    NOT NULL,
+                 content         TEXT    NOT NULL,
+                 timestamp       TEXT    NOT NULL,
+                 reply_to        TEXT,
+                 idempotency_key TEXT
+             );
+
+             CREATE INDEX idx_messages_channel_ts ON messages (channel_id, timestamp);
+             CREATE INDEX idx_messages_sender ON messages (sender);
+             CREATE UNIQUE INDEX idx_messages_idempotency
+                 ON messages (idempotency_key) WHERE idempotency_key IS NOT NULL;
+
+             CREATE TABLE mentions (
+                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                 message_id      TEXT    NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                 channel_id      INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+                 mentioned_agent TEXT    NOT NULL,
+                 created_at      TEXT    NOT NULL
+             );
+
+             CREATE TABLE schema_versions (
+                 version    INTEGER PRIMARY KEY,
+                 applied_at TEXT    NOT NULL
+             );
+
+             INSERT INTO schema_versions (version, applied_at) VALUES (1, '2025-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO channels (name, namespace, purpose, created_at, message_count) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["backfill-ch", "default", "test channel", "2025-01-01T00:00:00Z", 3],
+        ).unwrap();
+
+        for i in 1..=3 {
+            conn.execute(
+                "INSERT INTO messages (id, channel_id, sender, content, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    format!("msg-{i}"),
+                    1i64,
+                    "old-sender",
+                    format!("backfill searchterm message {i}"),
+                    format!("2025-01-01T00:00:0{i}Z")
+                ],
+            ).unwrap();
+        }
+    }
+
+    // Verify .bak file is created
+    let bak_path = tmp.path().join("test.db.bak");
+    assert!(!bak_path.exists());
+
+    // Run search which triggers Database::open — this should backfill the FTS index
+    let output = Command::cargo_bin("chat-management")
+        .unwrap()
+        .args(["--db", db_str, "--json", "search", "--query", "searchterm"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(bak_path.exists(), "Backup file should be created");
+
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["total"], 3);
+    let results = parsed["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert!(
+        results[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("searchterm")
+    );
+
+    // Verify backfill message in stderr
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Backfilled 3 messages into FTS index"),
+        "Expected backfill log in stderr, got: {stderr}"
+    );
 }
