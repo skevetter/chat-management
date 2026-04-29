@@ -1164,3 +1164,211 @@ fn test_search_json_output() {
     assert!(results[0]["timestamp"].as_str().is_some());
     assert!(results[0]["id"].as_str().is_some());
 }
+
+// === Channel Archiving ===
+
+#[test]
+fn test_archive_channel_excludes_from_list() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "active-ch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "to-archive"])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["channel", "archive", "to-archive"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("archived"));
+
+    let output = cmd_json(&tmp).args(["channel", "list"]).output().unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["total"], 1);
+    assert_eq!(parsed["channels"][0]["name"], "active-ch");
+}
+
+#[test]
+fn test_unarchive_channel_reappears_in_list() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "revive-ch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "archive", "revive-ch"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp).args(["channel", "list"]).output().unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["total"], 0);
+
+    cmd(&tmp)
+        .args(["channel", "unarchive", "revive-ch"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unarchived"));
+
+    let output = cmd_json(&tmp).args(["channel", "list"]).output().unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["total"], 1);
+    assert_eq!(parsed["channels"][0]["name"], "revive-ch");
+}
+
+#[test]
+fn test_include_archived_shows_all() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "visible"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "hidden"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "archive", "hidden"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args(["channel", "list", "--include-archived"])
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["total"], 2);
+}
+
+#[test]
+fn test_post_to_archived_channel_fails() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "frozen"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "archive", "frozen"])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args([
+            "post",
+            "frozen",
+            "--sender",
+            "agent",
+            "--content",
+            "should fail",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Cannot post to archived channel 'frozen'",
+        ));
+}
+
+#[test]
+fn test_post_to_archived_channel_json_error() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "frozen-json"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "archive", "frozen-json"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args([
+            "post",
+            "frozen-json",
+            "--sender",
+            "agent",
+            "--content",
+            "nope",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    assert!(parsed["error"]
+        .as_str()
+        .unwrap()
+        .contains("Cannot post to archived channel"));
+}
+
+#[test]
+fn test_read_from_archived_channel_works() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "readable"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "readable",
+            "--sender",
+            "agent",
+            "--content",
+            "still here",
+        ])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["channel", "archive", "readable"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args(["read", "readable"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["total"], 1);
+    assert_eq!(parsed["messages"][0]["content"], "still here");
+}
+
+#[test]
+fn test_archive_unarchive_by_name() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "named-ch"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args(["channel", "archive", "named-ch"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["name"], "named-ch");
+    assert_eq!(parsed["archived"], true);
+
+    let output = cmd_json(&tmp)
+        .args(["channel", "unarchive", "named-ch"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["name"], "named-ch");
+    assert_eq!(parsed["archived"], false);
+}
+
+#[test]
+fn test_archive_nonexistent_channel_fails() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "archive", "ghost"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
+}

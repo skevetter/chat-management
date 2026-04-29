@@ -156,11 +156,19 @@ enum ChannelCommands {
         limit: i64,
         #[arg(long, default_value_t = 0)]
         offset: i64,
+        #[arg(long)]
+        include_archived: bool,
     },
     Show {
         name_or_id: String,
     },
     Delete {
+        name_or_id: String,
+    },
+    Archive {
+        name_or_id: String,
+    },
+    Unarchive {
         name_or_id: String,
     },
 }
@@ -204,9 +212,13 @@ fn main() {
                     println!("{channel}");
                 }
             }
-            ChannelCommands::List { limit, offset } => {
+            ChannelCommands::List {
+                limit,
+                offset,
+                include_archived,
+            } => {
                 let result = db
-                    .list_channels(namespace, limit, offset)
+                    .list_channels(namespace, limit, offset, include_archived)
                     .unwrap_or_else(|e| {
                         output_error(&format!("Failed to list channels: {e}"), json);
                         std::process::exit(1);
@@ -276,6 +288,48 @@ fn main() {
                     std::process::exit(1);
                 }
             }
+            ChannelCommands::Archive { name_or_id } => {
+                let channel = db
+                    .archive_channel(&name_or_id, namespace)
+                    .unwrap_or_else(|e| {
+                        output_error(&format!("Failed to archive channel: {e}"), json);
+                        std::process::exit(1);
+                    });
+                match channel {
+                    Some(ch) => {
+                        if json {
+                            println!("{}", serde_json::to_string(&ch).unwrap());
+                        } else {
+                            println!("Channel archived: {}", ch.name);
+                        }
+                    }
+                    None => {
+                        output_error(&format!("Channel not found: {name_or_id}"), json);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            ChannelCommands::Unarchive { name_or_id } => {
+                let channel = db
+                    .unarchive_channel(&name_or_id, namespace)
+                    .unwrap_or_else(|e| {
+                        output_error(&format!("Failed to unarchive channel: {e}"), json);
+                        std::process::exit(1);
+                    });
+                match channel {
+                    Some(ch) => {
+                        if json {
+                            println!("{}", serde_json::to_string(&ch).unwrap());
+                        } else {
+                            println!("Channel unarchived: {}", ch.name);
+                        }
+                    }
+                    None => {
+                        output_error(&format!("Channel not found: {name_or_id}"), json);
+                        std::process::exit(1);
+                    }
+                }
+            }
         },
         Commands::Post {
             channel,
@@ -298,6 +352,13 @@ fn main() {
                     output_error(&format!("Channel not found: {channel}"), json);
                     std::process::exit(1);
                 });
+            if ch.archived {
+                output_error(
+                    &format!("Cannot post to archived channel '{}'", ch.name),
+                    json,
+                );
+                std::process::exit(1);
+            }
             let message = db
                 .post_message(
                     ch.id,

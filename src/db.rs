@@ -30,6 +30,7 @@ impl Database {
                  purpose       TEXT,
                  created_at    TEXT    NOT NULL,
                  message_count INTEGER NOT NULL DEFAULT 0,
+                 archived      INTEGER NOT NULL DEFAULT 0,
                  UNIQUE (name, namespace)
              );
 
@@ -91,6 +92,21 @@ impl Database {
             params![now],
         )?;
 
+        // Migration v2: add archived column to channels
+        let has_archived: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('channels') WHERE name = 'archived'")?
+            .query_row([], |row| row.get::<_, i64>(0))
+            .map(|c| c > 0)?;
+        if !has_archived {
+            conn.execute_batch(
+                "ALTER TABLE channels ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (2, ?1)",
+                params![now],
+            )?;
+        }
+
         // Rebuild FTS index if it's empty but messages exist
         let msg_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
@@ -129,6 +145,7 @@ impl Database {
             purpose: purpose.map(String::from),
             created_at: now,
             message_count: 0,
+            archived: false,
         })
     }
 
@@ -137,38 +154,40 @@ impl Database {
         namespace: Option<&str>,
         limit: i64,
         offset: i64,
+        include_archived: bool,
     ) -> Result<ChannelListResult> {
-        let (count_sql, query_sql, params_vec): (String, String, Vec<Box<dyn rusqlite::types::ToSql>>) =
-            match namespace {
-                Some(ns) => (
-                    "SELECT COUNT(*) FROM channels WHERE namespace = ?1".to_string(),
-                    "SELECT id, name, namespace, purpose, created_at, message_count FROM channels WHERE namespace = ?1 ORDER BY created_at DESC LIMIT ?2 OFFSET ?3".to_string(),
-                    vec![
-                        Box::new(ns.to_string()) as Box<dyn rusqlite::types::ToSql>,
-                        Box::new(limit),
-                        Box::new(offset),
-                    ],
-                ),
-                None => (
-                    "SELECT COUNT(*) FROM channels".to_string(),
-                    "SELECT id, name, namespace, purpose, created_at, message_count FROM channels ORDER BY created_at DESC LIMIT ?1 OFFSET ?2".to_string(),
-                    vec![
-                        Box::new(limit) as Box<dyn rusqlite::types::ToSql>,
-                        Box::new(offset),
-                    ],
-                ),
-            };
+        let mut conditions: Vec<String> = Vec::new();
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-        let count_params: Vec<&dyn rusqlite::types::ToSql> = match namespace {
-            Some(_) => vec![params_vec[0].as_ref()],
-            None => vec![],
+        if let Some(ns) = namespace {
+            conditions.push("namespace = ?".to_string());
+            param_values.push(Box::new(ns.to_string()));
+        }
+        if !include_archived {
+            conditions.push("archived = 0".to_string());
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
         };
+
+        let count_sql = format!("SELECT COUNT(*) FROM channels{where_clause}");
+        let count_params: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
         let total: i64 = self
             .conn
             .query_row(&count_sql, count_params.as_slice(), |row| row.get(0))?;
 
+        let query_sql = format!(
+            "SELECT id, name, namespace, purpose, created_at, message_count, archived FROM channels{where_clause} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        );
+        param_values.push(Box::new(limit));
+        param_values.push(Box::new(offset));
+
         let query_params: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| p.as_ref()).collect();
+            param_values.iter().map(|p| p.as_ref()).collect();
         let mut stmt = self.conn.prepare(&query_sql)?;
         let rows = stmt.query_map(query_params.as_slice(), |row| {
             Ok(Channel {
@@ -178,6 +197,7 @@ impl Database {
                 purpose: row.get(3)?,
                 created_at: row.get(4)?,
                 message_count: row.get(5)?,
+                archived: row.get::<_, i64>(6)? != 0,
             })
         })?;
 
@@ -200,7 +220,7 @@ impl Database {
     ) -> Result<Option<Channel>> {
         if let Ok(id) = name_or_id.parse::<i64>() {
             let mut stmt = self.conn.prepare(
-                "SELECT id, name, namespace, purpose, created_at, message_count FROM channels WHERE id = ?1",
+                "SELECT id, name, namespace, purpose, created_at, message_count, archived FROM channels WHERE id = ?1",
             )?;
             let mut rows = stmt.query_map(params![id], |row| {
                 Ok(Channel {
@@ -210,6 +230,7 @@ impl Database {
                     purpose: row.get(3)?,
                     created_at: row.get(4)?,
                     message_count: row.get(5)?,
+                    archived: row.get::<_, i64>(6)? != 0,
                 })
             })?;
             return match rows.next() {
@@ -221,7 +242,7 @@ impl Database {
 
         let ns = namespace.unwrap_or("default");
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, namespace, purpose, created_at, message_count FROM channels WHERE name = ?1 AND namespace = ?2",
+            "SELECT id, name, namespace, purpose, created_at, message_count, archived FROM channels WHERE name = ?1 AND namespace = ?2",
         )?;
         let mut rows = stmt.query_map(params![name_or_id, ns], |row| {
             Ok(Channel {
@@ -231,6 +252,7 @@ impl Database {
                 purpose: row.get(3)?,
                 created_at: row.get(4)?,
                 message_count: row.get(5)?,
+                archived: row.get::<_, i64>(6)? != 0,
             })
         })?;
         match rows.next() {
@@ -247,6 +269,44 @@ impl Database {
                 self.conn
                     .execute("DELETE FROM channels WHERE id = ?1", params![ch.id])?;
                 Ok(Some(ch.id))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn archive_channel(
+        &self,
+        name_or_id: &str,
+        namespace: Option<&str>,
+    ) -> Result<Option<Channel>> {
+        let channel = self.get_channel(name_or_id, namespace)?;
+        match channel {
+            Some(mut ch) => {
+                self.conn.execute(
+                    "UPDATE channels SET archived = 1 WHERE id = ?1",
+                    params![ch.id],
+                )?;
+                ch.archived = true;
+                Ok(Some(ch))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn unarchive_channel(
+        &self,
+        name_or_id: &str,
+        namespace: Option<&str>,
+    ) -> Result<Option<Channel>> {
+        let channel = self.get_channel(name_or_id, namespace)?;
+        match channel {
+            Some(mut ch) => {
+                self.conn.execute(
+                    "UPDATE channels SET archived = 0 WHERE id = ?1",
+                    params![ch.id],
+                )?;
+                ch.archived = false;
+                Ok(Some(ch))
             }
             None => Ok(None),
         }

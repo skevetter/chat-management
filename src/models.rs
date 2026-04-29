@@ -10,6 +10,7 @@ pub struct Channel {
     pub purpose: Option<String>,
     pub created_at: String,
     pub message_count: i64,
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +92,9 @@ impl fmt::Display for Channel {
             writeln!(f, "Purpose:       {purpose}")?;
         }
         writeln!(f, "Messages:      {}", self.message_count)?;
+        if self.archived {
+            writeln!(f, "Archived:      true")?;
+        }
         write!(f, "Created:       {}", self.created_at)
     }
 }

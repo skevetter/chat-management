@@ -93,10 +93,11 @@ impl ChatMcpServer {
         let ns = self.resolve_namespace(&params.namespace);
         let limit = params.limit.unwrap_or(50);
         let offset = params.offset.unwrap_or(0);
+        let include_archived = params.include_archived.unwrap_or(false);
 
         let db = self.db.lock().unwrap();
         let result = db
-            .list_channels(ns, limit, offset)
+            .list_channels(ns, limit, offset, include_archived)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -145,6 +146,46 @@ impl ChatMcpServer {
         )]))
     }
 
+    #[tool(description = "Archive a channel (prevents new posts)")]
+    fn archive_channel(
+        &self,
+        Parameters(params): Parameters<ArchiveChannelParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ns = self.resolve_namespace(&params.namespace);
+
+        let db = self.db.lock().unwrap();
+        let channel = db
+            .archive_channel(&params.channel, ns)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            .ok_or_else(|| {
+                ErrorData::invalid_params(format!("Channel not found: {}", params.channel), None)
+            })?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&channel).unwrap(),
+        )]))
+    }
+
+    #[tool(description = "Unarchive a channel (allows new posts again)")]
+    fn unarchive_channel(
+        &self,
+        Parameters(params): Parameters<UnarchiveChannelParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ns = self.resolve_namespace(&params.namespace);
+
+        let db = self.db.lock().unwrap();
+        let channel = db
+            .unarchive_channel(&params.channel, ns)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
+            .ok_or_else(|| {
+                ErrorData::invalid_params(format!("Channel not found: {}", params.channel), None)
+            })?;
+
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::to_string(&channel).unwrap(),
+        )]))
+    }
+
     #[tool(description = "Post a message to a channel")]
     fn post_message(
         &self,
@@ -166,6 +207,13 @@ impl ChatMcpServer {
             .ok_or_else(|| {
                 ErrorData::invalid_params(format!("Channel not found: {}", params.channel), None)
             })?;
+
+        if channel.archived {
+            return Err(ErrorData::invalid_params(
+                format!("Cannot post to archived channel '{}'", channel.name),
+                None,
+            ));
+        }
 
         let message = db
             .post_message(
