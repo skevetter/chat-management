@@ -738,3 +738,254 @@ fn test_channel_create_duplicate_fails() {
         .assert()
         .failure();
 }
+
+// === Bug Fix: --since relative duration parsing ===
+
+#[test]
+fn test_read_since_relative_duration() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "relch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["post", "relch", "--sender", "a", "--content", "recent msg"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args(["read", "relch", "--since", "5m"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["messages"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn test_read_since_relative_hours() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "hrch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["post", "hrch", "--sender", "a", "--content", "msg"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args(["read", "hrch", "--since", "1h"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["messages"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn test_read_since_relative_seconds() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "secch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["post", "secch", "--sender", "a", "--content", "msg"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args(["read", "secch", "--since", "30s"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["messages"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn test_read_since_invalid_format_errors() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "badch"])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["read", "badch", "--since", "invalid"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid --since value"));
+}
+
+#[test]
+fn test_read_since_iso_timestamp_still_works() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "isoch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["post", "isoch", "--sender", "a", "--content", "msg"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args(["read", "isoch", "--since", "2000-01-01T00:00:00Z"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["messages"].as_array().unwrap().len(), 1);
+}
+
+// === Bug Fix: JSON error formatting ===
+
+#[test]
+fn test_json_error_format_channel_not_found() {
+    let tmp = TempDir::new().unwrap();
+    let output = cmd_json(&tmp)
+        .args(["channel", "show", "nonexistent"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    assert!(parsed["error"].as_str().unwrap().contains("not found"));
+}
+
+#[test]
+fn test_json_error_format_post_to_nonexistent() {
+    let tmp = TempDir::new().unwrap();
+    let output = cmd_json(&tmp)
+        .args(["post", "ghost", "--sender", "x", "--content", "hello"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    assert!(parsed["error"].as_str().unwrap().contains("not found"));
+}
+
+#[test]
+fn test_json_error_format_invalid_since() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "errch"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args(["read", "errch", "--since", "garbage"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    assert!(
+        parsed["error"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid --since value")
+    );
+}
+
+// === Bug Fix: Empty content validation ===
+
+#[test]
+fn test_post_empty_content_rejected() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "emptych"])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["post", "emptych", "--sender", "a", "--content", ""])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be empty"));
+}
+
+#[test]
+fn test_post_whitespace_only_content_rejected() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "wsch"])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["post", "wsch", "--sender", "a", "--content", "   "])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be empty"));
+}
+
+#[test]
+fn test_post_empty_content_json_error() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "emptyjch"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp)
+        .args(["post", "emptyjch", "--sender", "a", "--content", ""])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    assert!(
+        parsed["error"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be empty")
+    );
+}
+
+// === Feature: Message count in channel list ===
+
+#[test]
+fn test_channel_list_includes_message_count() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "cntch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["post", "cntch", "--sender", "a", "--content", "one"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["post", "cntch", "--sender", "a", "--content", "two"])
+        .assert()
+        .success();
+
+    let output = cmd_json(&tmp).args(["channel", "list"]).output().unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["channels"][0]["message_count"], 2);
+}
+
+#[test]
+fn test_channel_list_table_shows_message_count() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "tblch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args(["post", "tblch", "--sender", "a", "--content", "hi"])
+        .assert()
+        .success();
+
+    cmd(&tmp)
+        .args(["channel", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("MSGS"))
+        .stdout(predicate::str::contains("1"));
+}
