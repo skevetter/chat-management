@@ -188,7 +188,7 @@ fn test_post_message_json() {
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(parsed["sender"], "bot");
     assert_eq!(parsed["content"], "Test msg");
-    assert!(parsed["id"].as_str().unwrap().len() > 0);
+    assert!(!parsed["id"].as_str().unwrap().is_empty());
 }
 
 #[test]
