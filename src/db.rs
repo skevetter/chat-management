@@ -1,7 +1,12 @@
+use std::sync::LazyLock;
+
 use chrono::Utc;
 use regex::Regex;
 use rusqlite::{Connection, Result, params};
 use uuid::Uuid;
+
+static MENTION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"@([a-zA-Z0-9_\-]+)").unwrap());
 
 use crate::models::{
     Channel, ChannelListResult, Mention, MentionListResult, Message, MessageListResult,
@@ -211,15 +216,15 @@ impl Database {
         }
     }
 
-    pub fn delete_channel(&self, name_or_id: &str, namespace: Option<&str>) -> Result<bool> {
+    pub fn delete_channel(&self, name_or_id: &str, namespace: Option<&str>) -> Result<Option<i64>> {
         let channel = self.get_channel(name_or_id, namespace)?;
         match channel {
             Some(ch) => {
                 self.conn
                     .execute("DELETE FROM channels WHERE id = ?1", params![ch.id])?;
-                Ok(true)
+                Ok(Some(ch.id))
             }
-            None => Ok(false),
+            None => Ok(None),
         }
     }
 
@@ -231,45 +236,49 @@ impl Database {
         reply_to: Option<&str>,
         idempotency_key: Option<&str>,
     ) -> Result<Message> {
-        if let Some(key) = idempotency_key {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, channel_id, sender, content, timestamp, reply_to, idempotency_key FROM messages WHERE idempotency_key = ?1",
-            )?;
-            let mut rows = stmt.query_map(params![key], |row| {
-                Ok(Message {
-                    id: row.get(0)?,
-                    channel_id: row.get(1)?,
-                    sender: row.get(2)?,
-                    content: row.get(3)?,
-                    timestamp: row.get(4)?,
-                    reply_to: row.get(5)?,
-                    idempotency_key: row.get(6)?,
-                })
-            })?;
-            if let Some(Ok(existing)) = rows.next() {
-                return Ok(existing);
-            }
-        }
-
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
-        self.conn.execute(
+        match self.conn.execute(
             "INSERT INTO messages (id, channel_id, sender, content, timestamp, reply_to, idempotency_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![id, channel_id, sender, content, now, reply_to, idempotency_key],
-        )?;
-
-        self.extract_and_store_mentions(&id, channel_id, content)?;
-
-        Ok(Message {
-            id,
-            channel_id,
-            sender: sender.to_string(),
-            content: content.to_string(),
-            timestamp: now,
-            reply_to: reply_to.map(String::from),
-            idempotency_key: idempotency_key.map(String::from),
-        })
+        ) {
+            Ok(_) => {
+                self.extract_and_store_mentions(&id, channel_id, content)?;
+                Ok(Message {
+                    id,
+                    channel_id,
+                    sender: sender.to_string(),
+                    content: content.to_string(),
+                    timestamp: now,
+                    reply_to: reply_to.map(String::from),
+                    idempotency_key: idempotency_key.map(String::from),
+                })
+            }
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation
+                    && idempotency_key.is_some() =>
+            {
+                let key = idempotency_key.unwrap();
+                let existing = self.conn.query_row(
+                    "SELECT id, channel_id, sender, content, timestamp, reply_to, idempotency_key FROM messages WHERE idempotency_key = ?1 AND channel_id = ?2",
+                    params![key, channel_id],
+                    |row| {
+                        Ok(Message {
+                            id: row.get(0)?,
+                            channel_id: row.get(1)?,
+                            sender: row.get(2)?,
+                            content: row.get(3)?,
+                            timestamp: row.get(4)?,
+                            reply_to: row.get(5)?,
+                            idempotency_key: row.get(6)?,
+                        })
+                    },
+                )?;
+                Ok(existing)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn read_messages(
@@ -411,13 +420,12 @@ impl Database {
         channel_id: i64,
         content: &str,
     ) -> Result<Vec<Mention>> {
-        let re = Regex::new(r"@([a-zA-Z0-9_-]+)").unwrap();
         let now = Utc::now().to_rfc3339();
 
         let mut seen = std::collections::HashSet::new();
         let mut mentions = Vec::new();
 
-        for cap in re.captures_iter(content) {
+        for cap in MENTION_RE.captures_iter(content) {
             let agent = cap[1].to_string();
             if !seen.insert(agent.clone()) {
                 continue;

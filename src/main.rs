@@ -206,17 +206,17 @@ fn main() {
                 }
             }
             ChannelCommands::Delete { name_or_id } => {
-                let deleted = db
+                let deleted_id = db
                     .delete_channel(&name_or_id, namespace)
                     .unwrap_or_else(|e| {
                         eprintln!("Failed to delete channel: {e}");
                         std::process::exit(1);
                     });
-                if deleted {
+                if let Some(id) = deleted_id {
                     if json {
                         println!(
                             "{}",
-                            serde_json::to_string(&serde_json::json!({"deleted": true})).unwrap()
+                            serde_json::to_string(&serde_json::json!({"deleted": true, "channel_id": id})).unwrap()
                         );
                     } else {
                         println!("Channel deleted: {name_or_id}");
