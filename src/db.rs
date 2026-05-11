@@ -581,6 +581,18 @@ impl Database {
 
         let where_clause = conditions.join(" AND ");
 
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM messages m \
+             JOIN messages_fts ON messages_fts.rowid = m.rowid \
+             JOIN channels c ON c.id = m.channel_id \
+             WHERE {where_clause}"
+        );
+        let count_params: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+        let total: i64 =
+            self.conn
+                .query_row(&count_sql, count_params.as_slice(), |row| row.get(0))?;
+
         let sql = format!(
             "SELECT m.id, c.name, m.sender, m.timestamp, m.content \
              FROM messages m \
@@ -609,7 +621,6 @@ impl Database {
         for row in rows {
             results.push(row?);
         }
-        let total = results.len() as i64;
         Ok(SearchResult { results, total })
     }
 
