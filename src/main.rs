@@ -1,42 +1,21 @@
 mod db;
 mod mcp;
 mod models;
+mod utils;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
-use clap::{Parser, Subcommand};
-use regex::Regex;
+use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::utils::resolve_since;
 use db::Database;
 
-fn parse_relative_duration(s: &str) -> Option<String> {
-    let re = Regex::new(r"^(\d+)(s|m|h|d)$").unwrap();
-    let caps = re.captures(s)?;
-    let amount: i64 = caps[1].parse().ok()?;
-    let seconds = match &caps[2] {
-        "s" => amount,
-        "m" => amount * 60,
-        "h" => amount * 3600,
-        "d" => amount * 86400,
-        _ => return None,
-    };
-    let now = Utc::now();
-    let past = now - chrono::Duration::seconds(seconds);
-    Some(past.to_rfc3339())
-}
-
-fn resolve_since(since: &str) -> Result<String, String> {
-    if let Some(ts) = parse_relative_duration(since) {
-        return Ok(ts);
-    }
-    if chrono::DateTime::parse_from_rfc3339(since).is_ok() {
-        return Ok(since.to_string());
-    }
-    Err(format!(
-        "Invalid --since value: '{since}'. Use a relative duration (e.g., '5m', '1h', '30s') or an ISO 8601 timestamp."
-    ))
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum OutputFormat {
+    Json,
+    Csv,
+    Table,
 }
 
 fn output_error(msg: &str, json: bool) {
@@ -44,6 +23,122 @@ fn output_error(msg: &str, json: bool) {
         eprintln!("{}", serde_json::json!({"error": msg}));
     } else {
         eprintln!("{msg}");
+    }
+}
+
+fn csv_quote(field: &str) -> String {
+    if field.contains(',') || field.contains('"') || field.contains('\n') {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+fn print_csv(headers: &[&str], rows: &[Vec<String>]) {
+    println!(
+        "{}",
+        headers
+            .iter()
+            .map(|h| csv_quote(h))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for row in rows {
+        println!(
+            "{}",
+            row.iter()
+                .map(|f| csv_quote(f))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+}
+
+fn apply_filter(value: serde_json::Value, fields: &[String]) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let filtered = fields
+                .iter()
+                .filter_map(|f| map.get(f).map(|v| (f.clone(), v.clone())))
+                .collect();
+            serde_json::Value::Object(filtered)
+        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.into_iter().map(|v| apply_filter(v, fields)).collect(),
+        ),
+        other => other,
+    }
+}
+
+fn filter_json_output(value: serde_json::Value, fields: &[String]) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(mut map) => {
+            let array_key = map
+                .iter()
+                .find(|(_, v)| v.is_array())
+                .map(|(k, _)| k.clone());
+            if let Some(key) = array_key {
+                if let Some(arr) = map.remove(&key) {
+                    map.insert(key, apply_filter(arr, fields));
+                }
+                serde_json::Value::Object(map)
+            } else {
+                apply_filter(serde_json::Value::Object(map), fields)
+            }
+        }
+        other => apply_filter(other, fields),
+    }
+}
+
+fn filter_tabular_data(
+    headers: &[&str],
+    rows: &[Vec<String>],
+    fields: &[String],
+) -> (Vec<String>, Vec<Vec<String>>) {
+    let valid: Vec<(String, usize)> = fields
+        .iter()
+        .filter_map(|f| {
+            headers
+                .iter()
+                .position(|h| *h == f.as_str())
+                .map(|i| (f.clone(), i))
+        })
+        .collect();
+    let new_headers = valid.iter().map(|(f, _)| f.clone()).collect();
+    let new_rows = rows
+        .iter()
+        .map(|row| valid.iter().map(|(_, i)| row[*i].clone()).collect())
+        .collect();
+    (new_headers, new_rows)
+}
+
+fn print_table(headers: &[String], rows: &[Vec<String>]) {
+    if headers.is_empty() {
+        return;
+    }
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < widths.len() {
+                widths[i] = widths[i].max(cell.len());
+            }
+        }
+    }
+    let header_parts: Vec<String> = headers
+        .iter()
+        .zip(&widths)
+        .map(|(h, w)| format!("{:<width$}", h.to_uppercase(), width = w))
+        .collect();
+    let sep_width: usize = widths.iter().sum::<usize>() + 2 * widths.len().saturating_sub(1);
+    println!("{}", header_parts.join("  "));
+    println!("{}", "-".repeat(sep_width));
+    for row in rows {
+        let parts: Vec<String> = row
+            .iter()
+            .zip(&widths)
+            .map(|(cell, w)| format!("{:<width$}", cell, width = w))
+            .collect();
+        println!("{}", parts.join("  "));
     }
 }
 
@@ -79,6 +174,12 @@ struct Cli {
 
     #[arg(long, global = true)]
     json: bool,
+
+    #[arg(long, global = true, value_enum)]
+    output: Option<OutputFormat>,
+
+    #[arg(long, global = true)]
+    filter: Option<String>,
 
     #[arg(long, short = 'n', global = true)]
     namespace: Option<String>,
@@ -181,7 +282,15 @@ enum ChannelCommands {
 
 fn main() {
     let cli = Cli::parse();
-    let json = cli.json;
+    let format = cli.output.unwrap_or(if cli.json {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Table
+    });
+    let json = format == OutputFormat::Json;
+    let filter: Option<Vec<String>> = cli.filter.map(|f| {
+        f.split(',').map(|s| s.trim().to_string()).collect()
+    });
     let db_path = match cli.db {
         Some(p) => PathBuf::from(p),
         None => default_db_path(),
@@ -229,26 +338,76 @@ fn main() {
                         output_error(&format!("Failed to list channels: {e}"), json);
                         std::process::exit(1);
                     });
-                if json {
-                    println!("{}", serde_json::to_string(&result).unwrap());
-                } else if result.channels.is_empty() {
-                    println!("No channels found.");
-                } else {
-                    println!(
-                        "{:<6} {:<20} {:<12} {:<8} PURPOSE",
-                        "ID", "NAME", "NAMESPACE", "MSGS"
-                    );
-                    println!("{}", "-".repeat(60));
-                    for ch in &result.channels {
-                        let purpose = ch.purpose.as_deref().unwrap_or("-");
-                        println!(
-                            "{:<6} {:<20} {:<12} {:<8} {}",
-                            ch.id, ch.name, ch.namespace, ch.message_count, purpose
-                        );
+                let ch_headers: &[&str] = &[
+                    "id",
+                    "name",
+                    "namespace",
+                    "purpose",
+                    "message_count",
+                    "archived",
+                    "created_at",
+                ];
+                let ch_rows: Vec<Vec<String>> = result
+                    .channels
+                    .iter()
+                    .map(|ch| {
+                        vec![
+                            ch.id.to_string(),
+                            ch.name.clone(),
+                            ch.namespace.clone(),
+                            ch.purpose.clone().unwrap_or_default(),
+                            ch.message_count.to_string(),
+                            ch.archived.to_string(),
+                            ch.created_at.clone(),
+                        ]
+                    })
+                    .collect();
+                match format {
+                    OutputFormat::Json => {
+                        let val = serde_json::to_value(&result).unwrap();
+                        let out = if let Some(ref f) = filter {
+                            filter_json_output(val, f)
+                        } else {
+                            val
+                        };
+                        println!("{}", serde_json::to_string(&out).unwrap());
                     }
-                    let start = offset + 1;
-                    let end = offset + result.channels.len() as i64;
-                    println!("\nShowing {start}-{end} of {} channel(s)", result.total);
+                    OutputFormat::Csv => {
+                        if let Some(ref f) = filter {
+                            let (fh, fr) = filter_tabular_data(ch_headers, &ch_rows, f);
+                            let fh_refs: Vec<&str> = fh.iter().map(|s| s.as_str()).collect();
+                            print_csv(&fh_refs, &fr);
+                        } else {
+                            print_csv(ch_headers, &ch_rows);
+                        }
+                    }
+                    OutputFormat::Table => {
+                        if result.channels.is_empty() {
+                            println!("No channels found.");
+                        } else if let Some(ref f) = filter {
+                            let (fh, fr) = filter_tabular_data(ch_headers, &ch_rows, f);
+                            print_table(&fh, &fr);
+                        } else {
+                            println!(
+                                "{:<6} {:<20} {:<12} {:<8} PURPOSE",
+                                "ID", "NAME", "NAMESPACE", "MSGS"
+                            );
+                            println!("{}", "-".repeat(60));
+                            for ch in &result.channels {
+                                let purpose = ch.purpose.as_deref().unwrap_or("-");
+                                println!(
+                                    "{:<6} {:<20} {:<12} {:<8} {}",
+                                    ch.id, ch.name, ch.namespace, ch.message_count, purpose
+                                );
+                            }
+                            let start = offset + 1;
+                            let end = offset + result.channels.len() as i64;
+                            println!(
+                                "\nShowing {start}-{end} of {} channel(s)",
+                                result.total
+                            );
+                        }
+                    }
                 }
             }
             ChannelCommands::Show { name_or_id } => {
@@ -258,10 +417,54 @@ fn main() {
                 });
                 match channel {
                     Some(ch) => {
-                        if json {
-                            println!("{}", serde_json::to_string(&ch).unwrap());
-                        } else {
-                            println!("{ch}");
+                        let show_headers: &[&str] = &[
+                            "id",
+                            "name",
+                            "namespace",
+                            "purpose",
+                            "message_count",
+                            "archived",
+                            "created_at",
+                        ];
+                        let show_rows = vec![vec![
+                            ch.id.to_string(),
+                            ch.name.clone(),
+                            ch.namespace.clone(),
+                            ch.purpose.clone().unwrap_or_default(),
+                            ch.message_count.to_string(),
+                            ch.archived.to_string(),
+                            ch.created_at.clone(),
+                        ]];
+                        match format {
+                            OutputFormat::Json => {
+                                let val = serde_json::to_value(&ch).unwrap();
+                                let out = if let Some(ref f) = filter {
+                                    apply_filter(val, f)
+                                } else {
+                                    val
+                                };
+                                println!("{}", serde_json::to_string(&out).unwrap());
+                            }
+                            OutputFormat::Csv => {
+                                if let Some(ref f) = filter {
+                                    let (fh, fr) =
+                                        filter_tabular_data(show_headers, &show_rows, f);
+                                    let fh_refs: Vec<&str> =
+                                        fh.iter().map(|s| s.as_str()).collect();
+                                    print_csv(&fh_refs, &fr);
+                                } else {
+                                    print_csv(show_headers, &show_rows);
+                                }
+                            }
+                            OutputFormat::Table => {
+                                if let Some(ref f) = filter {
+                                    let (fh, fr) =
+                                        filter_tabular_data(show_headers, &show_rows, f);
+                                    print_table(&fh, &fr);
+                                } else {
+                                    println!("{ch}");
+                                }
+                            }
                         }
                     }
                     None => {
@@ -418,18 +621,56 @@ fn main() {
                     output_error(&format!("Failed to read messages: {e}"), json);
                     std::process::exit(1);
                 });
-            if json {
-                println!("{}", serde_json::to_string(&result).unwrap());
-            } else if result.messages.is_empty() {
-                println!("No messages found.");
-            } else {
-                for msg in &result.messages {
-                    println!("{msg}");
-                    println!();
+            let msg_headers: &[&str] =
+                &["id", "sender", "content", "timestamp", "reply_to"];
+            let msg_rows: Vec<Vec<String>> = result
+                .messages
+                .iter()
+                .map(|msg| {
+                    vec![
+                        msg.id.clone(),
+                        msg.sender.clone(),
+                        msg.content.clone(),
+                        msg.timestamp.clone(),
+                        msg.reply_to.clone().unwrap_or_default(),
+                    ]
+                })
+                .collect();
+            match format {
+                OutputFormat::Json => {
+                    let val = serde_json::to_value(&result).unwrap();
+                    let out = if let Some(ref f) = filter {
+                        filter_json_output(val, f)
+                    } else {
+                        val
+                    };
+                    println!("{}", serde_json::to_string(&out).unwrap());
                 }
-                let start = offset + 1;
-                let end = offset + result.messages.len() as i64;
-                println!("Showing {start}-{end} of {} message(s)", result.total);
+                OutputFormat::Csv => {
+                    if let Some(ref f) = filter {
+                        let (fh, fr) = filter_tabular_data(msg_headers, &msg_rows, f);
+                        let fh_refs: Vec<&str> = fh.iter().map(|s| s.as_str()).collect();
+                        print_csv(&fh_refs, &fr);
+                    } else {
+                        print_csv(msg_headers, &msg_rows);
+                    }
+                }
+                OutputFormat::Table => {
+                    if result.messages.is_empty() {
+                        println!("No messages found.");
+                    } else if let Some(ref f) = filter {
+                        let (fh, fr) = filter_tabular_data(msg_headers, &msg_rows, f);
+                        print_table(&fh, &fr);
+                    } else {
+                        for msg in &result.messages {
+                            println!("{msg}");
+                            println!();
+                        }
+                        let start = offset + 1;
+                        let end = offset + result.messages.len() as i64;
+                        println!("Showing {start}-{end} of {} message(s)", result.total);
+                    }
+                }
             }
         }
         Commands::Inspect { channel } => {
@@ -439,10 +680,54 @@ fn main() {
             });
             match ch {
                 Some(c) => {
-                    if json {
-                        println!("{}", serde_json::to_string(&c).unwrap());
-                    } else {
-                        println!("{c}");
+                    let insp_headers: &[&str] = &[
+                        "id",
+                        "name",
+                        "namespace",
+                        "purpose",
+                        "message_count",
+                        "archived",
+                        "created_at",
+                    ];
+                    let insp_rows = vec![vec![
+                        c.id.to_string(),
+                        c.name.clone(),
+                        c.namespace.clone(),
+                        c.purpose.clone().unwrap_or_default(),
+                        c.message_count.to_string(),
+                        c.archived.to_string(),
+                        c.created_at.clone(),
+                    ]];
+                    match format {
+                        OutputFormat::Json => {
+                            let val = serde_json::to_value(&c).unwrap();
+                            let out = if let Some(ref f) = filter {
+                                apply_filter(val, f)
+                            } else {
+                                val
+                            };
+                            println!("{}", serde_json::to_string(&out).unwrap());
+                        }
+                        OutputFormat::Csv => {
+                            if let Some(ref f) = filter {
+                                let (fh, fr) =
+                                    filter_tabular_data(insp_headers, &insp_rows, f);
+                                let fh_refs: Vec<&str> =
+                                    fh.iter().map(|s| s.as_str()).collect();
+                                print_csv(&fh_refs, &fr);
+                            } else {
+                                print_csv(insp_headers, &insp_rows);
+                            }
+                        }
+                        OutputFormat::Table => {
+                            if let Some(ref f) = filter {
+                                let (fh, fr) =
+                                    filter_tabular_data(insp_headers, &insp_rows, f);
+                                print_table(&fh, &fr);
+                            } else {
+                                println!("{c}");
+                            }
+                        }
                     }
                 }
                 None => {
@@ -475,22 +760,71 @@ fn main() {
                     output_error(&format!("Failed to list mentions: {e}"), json);
                     std::process::exit(1);
                 });
-            if json {
-                println!("{}", serde_json::to_string(&result).unwrap());
-            } else if result.mentions.is_empty() {
-                println!("No mentions found.");
-            } else {
-                println!("{:<6} {:<38} {:<6} AGENT", "ID", "MESSAGE_ID", "CH_ID");
-                println!("{}", "-".repeat(70));
-                for m in &result.mentions {
-                    println!(
-                        "{:<6} {:<38} {:<6} {}",
-                        m.id, m.message_id, m.channel_id, m.mentioned_agent
-                    );
+            let ment_headers: &[&str] = &[
+                "id",
+                "message_id",
+                "channel_id",
+                "mentioned_agent",
+                "created_at",
+            ];
+            let ment_rows: Vec<Vec<String>> = result
+                .mentions
+                .iter()
+                .map(|m| {
+                    vec![
+                        m.id.to_string(),
+                        m.message_id.clone(),
+                        m.channel_id.to_string(),
+                        m.mentioned_agent.clone(),
+                        m.created_at.clone(),
+                    ]
+                })
+                .collect();
+            match format {
+                OutputFormat::Json => {
+                    let val = serde_json::to_value(&result).unwrap();
+                    let out = if let Some(ref f) = filter {
+                        filter_json_output(val, f)
+                    } else {
+                        val
+                    };
+                    println!("{}", serde_json::to_string(&out).unwrap());
                 }
-                let start = offset + 1;
-                let end = offset + result.mentions.len() as i64;
-                println!("\nShowing {start}-{end} of {} mention(s)", result.total);
+                OutputFormat::Csv => {
+                    if let Some(ref f) = filter {
+                        let (fh, fr) = filter_tabular_data(ment_headers, &ment_rows, f);
+                        let fh_refs: Vec<&str> = fh.iter().map(|s| s.as_str()).collect();
+                        print_csv(&fh_refs, &fr);
+                    } else {
+                        print_csv(ment_headers, &ment_rows);
+                    }
+                }
+                OutputFormat::Table => {
+                    if result.mentions.is_empty() {
+                        println!("No mentions found.");
+                    } else if let Some(ref f) = filter {
+                        let (fh, fr) = filter_tabular_data(ment_headers, &ment_rows, f);
+                        print_table(&fh, &fr);
+                    } else {
+                        println!(
+                            "{:<6} {:<38} {:<6} AGENT",
+                            "ID", "MESSAGE_ID", "CH_ID"
+                        );
+                        println!("{}", "-".repeat(70));
+                        for m in &result.mentions {
+                            println!(
+                                "{:<6} {:<38} {:<6} {}",
+                                m.id, m.message_id, m.channel_id, m.mentioned_agent
+                            );
+                        }
+                        let start = offset + 1;
+                        let end = offset + result.mentions.len() as i64;
+                        println!(
+                            "\nShowing {start}-{end} of {} mention(s)",
+                            result.total
+                        );
+                    }
+                }
             }
         }
         Commands::Search {
@@ -516,16 +850,54 @@ fn main() {
                     output_error(&format!("Failed to search messages: {e}"), json);
                     std::process::exit(1);
                 });
-            if json {
-                println!("{}", serde_json::to_string(&result).unwrap());
-            } else if result.results.is_empty() {
-                println!("No messages found.");
-            } else {
-                for item in &result.results {
-                    println!("{item}");
-                    println!();
+            let srch_headers: &[&str] =
+                &["id", "sender", "content", "timestamp", "channel"];
+            let srch_rows: Vec<Vec<String>> = result
+                .results
+                .iter()
+                .map(|item| {
+                    vec![
+                        item.id.clone(),
+                        item.sender.clone(),
+                        item.content.clone(),
+                        item.timestamp.clone(),
+                        item.channel.clone(),
+                    ]
+                })
+                .collect();
+            match format {
+                OutputFormat::Json => {
+                    let val = serde_json::to_value(&result).unwrap();
+                    let out = if let Some(ref f) = filter {
+                        filter_json_output(val, f)
+                    } else {
+                        val
+                    };
+                    println!("{}", serde_json::to_string(&out).unwrap());
                 }
-                println!("{} result(s)", result.total);
+                OutputFormat::Csv => {
+                    if let Some(ref f) = filter {
+                        let (fh, fr) = filter_tabular_data(srch_headers, &srch_rows, f);
+                        let fh_refs: Vec<&str> = fh.iter().map(|s| s.as_str()).collect();
+                        print_csv(&fh_refs, &fr);
+                    } else {
+                        print_csv(srch_headers, &srch_rows);
+                    }
+                }
+                OutputFormat::Table => {
+                    if result.results.is_empty() {
+                        println!("No messages found.");
+                    } else if let Some(ref f) = filter {
+                        let (fh, fr) = filter_tabular_data(srch_headers, &srch_rows, f);
+                        print_table(&fh, &fr);
+                    } else {
+                        for item in &result.results {
+                            println!("{item}");
+                            println!();
+                        }
+                        println!("{} result(s)", result.total);
+                    }
+                }
             }
         }
         Commands::Wait { channel, timeout } => {

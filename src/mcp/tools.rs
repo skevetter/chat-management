@@ -66,7 +66,7 @@ pub struct ListMentionsParams {
 pub struct SearchMessagesParams {
     pub query: String,
     pub channel: Option<String>,
-    pub namespace: String,
+    pub namespace: Option<String>,
     pub limit: Option<i64>,
 }
 

@@ -1,43 +1,14 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
-use regex::Regex;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{ErrorData, tool, tool_router};
 
 use crate::db::Database;
+use crate::utils::resolve_since;
 
 use super::tools::*;
-
-fn parse_relative_duration(s: &str) -> Option<String> {
-    let re = Regex::new(r"^(\d+)(s|m|h|d)$").unwrap();
-    let caps = re.captures(s)?;
-    let amount: i64 = caps[1].parse().ok()?;
-    let seconds = match &caps[2] {
-        "s" => amount,
-        "m" => amount * 60,
-        "h" => amount * 3600,
-        "d" => amount * 86400,
-        _ => return None,
-    };
-    let now = Utc::now();
-    let past = now - chrono::Duration::seconds(seconds);
-    Some(past.to_rfc3339())
-}
-
-fn resolve_since(since: &str) -> Result<String, String> {
-    if let Some(ts) = parse_relative_duration(since) {
-        return Ok(ts);
-    }
-    if chrono::DateTime::parse_from_rfc3339(since).is_ok() {
-        return Ok(since.to_string());
-    }
-    Err(format!(
-        "Invalid since value: '{since}'. Use a relative duration (e.g., '5m', '1h', '30s') or an ISO 8601 timestamp."
-    ))
-}
 
 pub struct ChatMcpServer {
     db: Mutex<Database>,
@@ -329,7 +300,7 @@ impl ChatMcpServer {
         Parameters(params): Parameters<SearchMessagesParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let limit = params.limit.unwrap_or(20);
-        let ns = Some(params.namespace.as_str());
+        let ns = self.resolve_namespace(&params.namespace);
 
         let db = self.db.lock().unwrap();
         let channel_id = match &params.channel {
@@ -357,7 +328,7 @@ impl ChatMcpServer {
     #[tool(
         description = "Wait for a new message in a channel (blocks until message arrives or timeout)"
     )]
-    fn wait_for_message(
+    async fn wait_for_message(
         &self,
         Parameters(params): Parameters<WaitForMessageParams>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -412,7 +383,7 @@ impl ChatMcpServer {
                     None,
                 ));
             }
-            std::thread::sleep(Duration::from_millis(500));
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 }
