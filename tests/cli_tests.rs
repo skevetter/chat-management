@@ -23,7 +23,20 @@ fn cmd_ns(tmp: &TempDir, ns: &str) -> Command {
 fn cmd_json(tmp: &TempDir) -> Command {
     let db_path = tmp.path().join("test.db");
     let mut cmd = Command::cargo_bin("chat-management").unwrap();
-    cmd.arg("--db").arg(db_path.to_str().unwrap()).arg("--json");
+    cmd.arg("--db")
+        .arg(db_path.to_str().unwrap())
+        .arg("--output")
+        .arg("json");
+    cmd
+}
+
+fn cmd_csv(tmp: &TempDir) -> Command {
+    let db_path = tmp.path().join("test.db");
+    let mut cmd = Command::cargo_bin("chat-management").unwrap();
+    cmd.arg("--db")
+        .arg(db_path.to_str().unwrap())
+        .arg("--output")
+        .arg("csv");
     cmd
 }
 
@@ -1503,7 +1516,8 @@ fn test_wait_json_output() {
         .args([
             "--db",
             &db_path,
-            "--json",
+            "--output",
+            "json",
             "wait",
             "wait-json",
             "--timeout",
@@ -1601,7 +1615,7 @@ fn test_fts5_backfill_existing_messages() {
     // Run search which triggers Database::open — this should backfill the FTS index
     let output = Command::cargo_bin("chat-management")
         .unwrap()
-        .args(["--db", db_str, "--json", "search", "--query", "searchterm"])
+        .args(["--db", db_str, "--output", "json", "search", "--query", "searchterm"])
         .output()
         .unwrap();
 
@@ -1625,4 +1639,140 @@ fn test_fts5_backfill_existing_messages() {
         stderr.contains("Backfilled 3 messages into FTS index"),
         "Expected backfill log in stderr, got: {stderr}"
     );
+}
+
+// === CSV Output ===
+
+#[test]
+fn test_channel_list_csv() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args([
+            "channel",
+            "create",
+            "--name",
+            "csv-ch",
+            "--purpose",
+            "CSV test",
+        ])
+        .assert()
+        .success();
+
+    let output = cmd_csv(&tmp).args(["channel", "list"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "id,name,namespace,purpose,message_count");
+    assert!(lines[1].contains("csv-ch"));
+    assert!(lines[1].contains("CSV test"));
+}
+
+#[test]
+fn test_channel_create_csv() {
+    let tmp = TempDir::new().unwrap();
+    let output = cmd_csv(&tmp)
+        .args(["channel", "create", "--name", "newcsv"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "id,name,namespace,purpose,message_count");
+    assert!(lines[1].contains("newcsv"));
+}
+
+#[test]
+fn test_read_messages_csv() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "csvread"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "csvread",
+            "--sender",
+            "alice",
+            "--content",
+            "hello world",
+        ])
+        .assert()
+        .success();
+
+    let output = cmd_csv(&tmp).args(["read", "csvread"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "id,channel_id,sender,timestamp,content");
+    assert!(lines[1].contains("alice"));
+    assert!(lines[1].contains("hello world"));
+}
+
+#[test]
+fn test_search_csv() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args(["channel", "create", "--name", "csvsearch"])
+        .assert()
+        .success();
+    cmd(&tmp)
+        .args([
+            "post",
+            "csvsearch",
+            "--sender",
+            "bob",
+            "--content",
+            "unique csv searchterm",
+        ])
+        .assert()
+        .success();
+
+    let output = cmd_csv(&tmp)
+        .args(["search", "--query", "searchterm"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines[0], "id,channel,sender,timestamp,content");
+    assert!(lines[1].contains("bob"));
+    assert!(lines[1].contains("unique csv searchterm"));
+}
+
+#[test]
+fn test_csv_escaping() {
+    let tmp = TempDir::new().unwrap();
+    cmd(&tmp)
+        .args([
+            "channel",
+            "create",
+            "--name",
+            "escapech",
+            "--purpose",
+            "has, commas",
+        ])
+        .assert()
+        .success();
+
+    let output = cmd_csv(&tmp).args(["channel", "list"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"has, commas\""));
+}
+
+#[test]
+fn test_output_flag_short_form() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("test.db");
+    let mut c = Command::cargo_bin("chat-management").unwrap();
+    c.arg("--db")
+        .arg(db_path.to_str().unwrap())
+        .arg("-o")
+        .arg("json")
+        .args(["channel", "create", "--name", "shortflag"]);
+    let output = c.output().unwrap();
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(parsed["name"], "shortflag");
 }
