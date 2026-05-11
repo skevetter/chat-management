@@ -300,7 +300,7 @@ impl ChatMcpServer {
         Parameters(params): Parameters<SearchMessagesParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let limit = params.limit.unwrap_or(20);
-        let ns = Some(params.namespace.as_str());
+        let ns = self.resolve_namespace(&params.namespace);
 
         let db = self.db.lock().unwrap();
         let channel_id = match &params.channel {
