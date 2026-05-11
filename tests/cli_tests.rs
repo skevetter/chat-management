@@ -817,7 +817,7 @@ fn test_read_since_invalid_format_errors() {
         .args(["read", "badch", "--since", "invalid"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Invalid --since value"));
+        .stderr(predicate::str::contains("Invalid since value"));
 }
 
 #[test]
@@ -888,7 +888,7 @@ fn test_json_error_format_invalid_since() {
         parsed["error"]
             .as_str()
             .unwrap()
-            .contains("Invalid --since value")
+            .contains("Invalid since value")
     );
 }
 
