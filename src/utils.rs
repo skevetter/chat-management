@@ -1,9 +1,13 @@
+use std::sync::LazyLock;
+
 use chrono::Utc;
 use regex::Regex;
 
+static DURATION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\d+)(s|m|h|d)$").unwrap());
+
 pub fn parse_relative_duration(s: &str) -> Option<String> {
-    let re = Regex::new(r"^(\d+)(s|m|h|d)$").unwrap();
-    let caps = re.captures(s)?;
+    let caps = DURATION_RE.captures(s)?;
     let amount: i64 = caps[1].parse().ok()?;
     let seconds = match &caps[2] {
         "s" => amount,
@@ -25,6 +29,6 @@ pub fn resolve_since(since: &str) -> Result<String, String> {
         return Ok(since.to_string());
     }
     Err(format!(
-        "Invalid --since value: '{since}'. Use a relative duration (e.g., '5m', '1h', '30s') or an ISO 8601 timestamp."
+        "Invalid duration format: '{since}'. Use a relative duration (e.g., '5m', '1h', '30s') or an ISO 8601 timestamp."
     ))
 }
