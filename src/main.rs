@@ -6,16 +6,51 @@ mod utils;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::utils::resolve_since;
 use db::Database;
+
+#[derive(Clone, Copy, Debug, PartialEq, ValueEnum)]
+enum OutputFormat {
+    Json,
+    Csv,
+    Table,
+}
 
 fn output_error(msg: &str, json: bool) {
     if json {
         eprintln!("{}", serde_json::json!({"error": msg}));
     } else {
         eprintln!("{msg}");
+    }
+}
+
+fn csv_quote(field: &str) -> String {
+    if field.contains(',') || field.contains('"') || field.contains('\n') {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+fn print_csv(headers: &[&str], rows: &[Vec<String>]) {
+    println!(
+        "{}",
+        headers
+            .iter()
+            .map(|h| csv_quote(h))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    for row in rows {
+        println!(
+            "{}",
+            row.iter()
+                .map(|f| csv_quote(f))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
     }
 }
 
@@ -51,6 +86,9 @@ struct Cli {
 
     #[arg(long, global = true)]
     json: bool,
+
+    #[arg(long, global = true, value_enum)]
+    output: Option<OutputFormat>,
 
     #[arg(long, short = 'n', global = true)]
     namespace: Option<String>,
@@ -153,7 +191,12 @@ enum ChannelCommands {
 
 fn main() {
     let cli = Cli::parse();
-    let json = cli.json;
+    let format = cli.output.unwrap_or(if cli.json {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Table
+    });
+    let json = format == OutputFormat::Json;
     let db_path = match cli.db {
         Some(p) => PathBuf::from(p),
         None => default_db_path(),
@@ -201,26 +244,61 @@ fn main() {
                         output_error(&format!("Failed to list channels: {e}"), json);
                         std::process::exit(1);
                     });
-                if json {
-                    println!("{}", serde_json::to_string(&result).unwrap());
-                } else if result.channels.is_empty() {
-                    println!("No channels found.");
-                } else {
-                    println!(
-                        "{:<6} {:<20} {:<12} {:<8} PURPOSE",
-                        "ID", "NAME", "NAMESPACE", "MSGS"
-                    );
-                    println!("{}", "-".repeat(60));
-                    for ch in &result.channels {
-                        let purpose = ch.purpose.as_deref().unwrap_or("-");
-                        println!(
-                            "{:<6} {:<20} {:<12} {:<8} {}",
-                            ch.id, ch.name, ch.namespace, ch.message_count, purpose
-                        );
+                match format {
+                    OutputFormat::Json => {
+                        println!("{}", serde_json::to_string(&result).unwrap());
                     }
-                    let start = offset + 1;
-                    let end = offset + result.channels.len() as i64;
-                    println!("\nShowing {start}-{end} of {} channel(s)", result.total);
+                    OutputFormat::Csv => {
+                        let headers = &[
+                            "id",
+                            "name",
+                            "namespace",
+                            "purpose",
+                            "message_count",
+                            "archived",
+                            "created_at",
+                        ];
+                        let rows: Vec<Vec<String>> = result
+                            .channels
+                            .iter()
+                            .map(|ch| {
+                                vec![
+                                    ch.id.to_string(),
+                                    ch.name.clone(),
+                                    ch.namespace.clone(),
+                                    ch.purpose.clone().unwrap_or_default(),
+                                    ch.message_count.to_string(),
+                                    ch.archived.to_string(),
+                                    ch.created_at.clone(),
+                                ]
+                            })
+                            .collect();
+                        print_csv(headers, &rows);
+                    }
+                    OutputFormat::Table => {
+                        if result.channels.is_empty() {
+                            println!("No channels found.");
+                        } else {
+                            println!(
+                                "{:<6} {:<20} {:<12} {:<8} PURPOSE",
+                                "ID", "NAME", "NAMESPACE", "MSGS"
+                            );
+                            println!("{}", "-".repeat(60));
+                            for ch in &result.channels {
+                                let purpose = ch.purpose.as_deref().unwrap_or("-");
+                                println!(
+                                    "{:<6} {:<20} {:<12} {:<8} {}",
+                                    ch.id, ch.name, ch.namespace, ch.message_count, purpose
+                                );
+                            }
+                            let start = offset + 1;
+                            let end = offset + result.channels.len() as i64;
+                            println!(
+                                "\nShowing {start}-{end} of {} channel(s)",
+                                result.total
+                            );
+                        }
+                    }
                 }
             }
             ChannelCommands::Show { name_or_id } => {
@@ -229,13 +307,35 @@ fn main() {
                     std::process::exit(1);
                 });
                 match channel {
-                    Some(ch) => {
-                        if json {
+                    Some(ch) => match format {
+                        OutputFormat::Json => {
                             println!("{}", serde_json::to_string(&ch).unwrap());
-                        } else {
+                        }
+                        OutputFormat::Csv => {
+                            let headers = &[
+                                "id",
+                                "name",
+                                "namespace",
+                                "purpose",
+                                "message_count",
+                                "archived",
+                                "created_at",
+                            ];
+                            let rows = vec![vec![
+                                ch.id.to_string(),
+                                ch.name.clone(),
+                                ch.namespace.clone(),
+                                ch.purpose.clone().unwrap_or_default(),
+                                ch.message_count.to_string(),
+                                ch.archived.to_string(),
+                                ch.created_at.clone(),
+                            ]];
+                            print_csv(headers, &rows);
+                        }
+                        OutputFormat::Table => {
                             println!("{ch}");
                         }
-                    }
+                    },
                     None => {
                         output_error(&format!("Channel not found: {name_or_id}"), json);
                         std::process::exit(1);
@@ -390,18 +490,40 @@ fn main() {
                     output_error(&format!("Failed to read messages: {e}"), json);
                     std::process::exit(1);
                 });
-            if json {
-                println!("{}", serde_json::to_string(&result).unwrap());
-            } else if result.messages.is_empty() {
-                println!("No messages found.");
-            } else {
-                for msg in &result.messages {
-                    println!("{msg}");
-                    println!();
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string(&result).unwrap());
                 }
-                let start = offset + 1;
-                let end = offset + result.messages.len() as i64;
-                println!("Showing {start}-{end} of {} message(s)", result.total);
+                OutputFormat::Csv => {
+                    let headers = &["id", "sender", "content", "timestamp", "reply_to"];
+                    let rows: Vec<Vec<String>> = result
+                        .messages
+                        .iter()
+                        .map(|msg| {
+                            vec![
+                                msg.id.clone(),
+                                msg.sender.clone(),
+                                msg.content.clone(),
+                                msg.timestamp.clone(),
+                                msg.reply_to.clone().unwrap_or_default(),
+                            ]
+                        })
+                        .collect();
+                    print_csv(headers, &rows);
+                }
+                OutputFormat::Table => {
+                    if result.messages.is_empty() {
+                        println!("No messages found.");
+                    } else {
+                        for msg in &result.messages {
+                            println!("{msg}");
+                            println!();
+                        }
+                        let start = offset + 1;
+                        let end = offset + result.messages.len() as i64;
+                        println!("Showing {start}-{end} of {} message(s)", result.total);
+                    }
+                }
             }
         }
         Commands::Inspect { channel } => {
@@ -410,13 +532,35 @@ fn main() {
                 std::process::exit(1);
             });
             match ch {
-                Some(c) => {
-                    if json {
+                Some(c) => match format {
+                    OutputFormat::Json => {
                         println!("{}", serde_json::to_string(&c).unwrap());
-                    } else {
+                    }
+                    OutputFormat::Csv => {
+                        let headers = &[
+                            "id",
+                            "name",
+                            "namespace",
+                            "purpose",
+                            "message_count",
+                            "archived",
+                            "created_at",
+                        ];
+                        let rows = vec![vec![
+                            c.id.to_string(),
+                            c.name.clone(),
+                            c.namespace.clone(),
+                            c.purpose.clone().unwrap_or_default(),
+                            c.message_count.to_string(),
+                            c.archived.to_string(),
+                            c.created_at.clone(),
+                        ]];
+                        print_csv(headers, &rows);
+                    }
+                    OutputFormat::Table => {
                         println!("{c}");
                     }
-                }
+                },
                 None => {
                     output_error(&format!("Channel not found: {channel}"), json);
                     std::process::exit(1);
@@ -447,22 +591,56 @@ fn main() {
                     output_error(&format!("Failed to list mentions: {e}"), json);
                     std::process::exit(1);
                 });
-            if json {
-                println!("{}", serde_json::to_string(&result).unwrap());
-            } else if result.mentions.is_empty() {
-                println!("No mentions found.");
-            } else {
-                println!("{:<6} {:<38} {:<6} AGENT", "ID", "MESSAGE_ID", "CH_ID");
-                println!("{}", "-".repeat(70));
-                for m in &result.mentions {
-                    println!(
-                        "{:<6} {:<38} {:<6} {}",
-                        m.id, m.message_id, m.channel_id, m.mentioned_agent
-                    );
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string(&result).unwrap());
                 }
-                let start = offset + 1;
-                let end = offset + result.mentions.len() as i64;
-                println!("\nShowing {start}-{end} of {} mention(s)", result.total);
+                OutputFormat::Csv => {
+                    let headers = &[
+                        "id",
+                        "message_id",
+                        "channel_id",
+                        "mentioned_agent",
+                        "created_at",
+                    ];
+                    let rows: Vec<Vec<String>> = result
+                        .mentions
+                        .iter()
+                        .map(|m| {
+                            vec![
+                                m.id.to_string(),
+                                m.message_id.clone(),
+                                m.channel_id.to_string(),
+                                m.mentioned_agent.clone(),
+                                m.created_at.clone(),
+                            ]
+                        })
+                        .collect();
+                    print_csv(headers, &rows);
+                }
+                OutputFormat::Table => {
+                    if result.mentions.is_empty() {
+                        println!("No mentions found.");
+                    } else {
+                        println!(
+                            "{:<6} {:<38} {:<6} AGENT",
+                            "ID", "MESSAGE_ID", "CH_ID"
+                        );
+                        println!("{}", "-".repeat(70));
+                        for m in &result.mentions {
+                            println!(
+                                "{:<6} {:<38} {:<6} {}",
+                                m.id, m.message_id, m.channel_id, m.mentioned_agent
+                            );
+                        }
+                        let start = offset + 1;
+                        let end = offset + result.mentions.len() as i64;
+                        println!(
+                            "\nShowing {start}-{end} of {} mention(s)",
+                            result.total
+                        );
+                    }
+                }
             }
         }
         Commands::Search {
@@ -488,16 +666,38 @@ fn main() {
                     output_error(&format!("Failed to search messages: {e}"), json);
                     std::process::exit(1);
                 });
-            if json {
-                println!("{}", serde_json::to_string(&result).unwrap());
-            } else if result.results.is_empty() {
-                println!("No messages found.");
-            } else {
-                for item in &result.results {
-                    println!("{item}");
-                    println!();
+            match format {
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string(&result).unwrap());
                 }
-                println!("{} result(s)", result.total);
+                OutputFormat::Csv => {
+                    let headers = &["id", "sender", "content", "timestamp", "channel"];
+                    let rows: Vec<Vec<String>> = result
+                        .results
+                        .iter()
+                        .map(|item| {
+                            vec![
+                                item.id.clone(),
+                                item.sender.clone(),
+                                item.content.clone(),
+                                item.timestamp.clone(),
+                                item.channel.clone(),
+                            ]
+                        })
+                        .collect();
+                    print_csv(headers, &rows);
+                }
+                OutputFormat::Table => {
+                    if result.results.is_empty() {
+                        println!("No messages found.");
+                    } else {
+                        for item in &result.results {
+                            println!("{item}");
+                            println!();
+                        }
+                        println!("{} result(s)", result.total);
+                    }
+                }
             }
         }
         Commands::Wait { channel, timeout } => {
