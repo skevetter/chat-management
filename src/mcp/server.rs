@@ -328,7 +328,7 @@ impl ChatMcpServer {
     #[tool(
         description = "Wait for a new message in a channel (blocks until message arrives or timeout)"
     )]
-    fn wait_for_message(
+    async fn wait_for_message(
         &self,
         Parameters(params): Parameters<WaitForMessageParams>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -383,7 +383,7 @@ impl ChatMcpServer {
                     None,
                 ));
             }
-            std::thread::sleep(Duration::from_millis(500));
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 }
