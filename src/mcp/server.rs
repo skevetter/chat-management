@@ -332,7 +332,7 @@ impl ChatMcpServer {
         &self,
         Parameters(params): Parameters<WaitForMessageParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let ns = Some(params.namespace.as_str());
+        let ns = self.resolve_namespace(&params.namespace);
         let timeout = params.timeout.unwrap_or(300);
 
         let (channel_id, baseline) = {
